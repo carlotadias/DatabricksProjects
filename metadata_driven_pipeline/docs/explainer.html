@@ -70,6 +70,7 @@
     <div class="tab" onclick="switchTab(2)">Configuration</div>
     <div class="tab" onclick="switchTab(3)">Reusable Notebooks</div>
     <div class="tab" onclick="switchTab(4)">Fault Tolerance</div>
+    <div class="tab" onclick="switchTab(5)">Schema Evolution</div>
   </div>
 
   <!-- TAB 1: ARCHITECTURE -->
@@ -517,6 +518,220 @@ pipeline_task:
         <li><strong>Lakeflow pipeline (ingest_and_decrypt)</strong>: checkpoints are managed internally by Lakeflow &mdash; use <strong>full refresh</strong> to reset them</li>
       </ul>
     </div>
+  </div>
+
+  <!-- TAB 6: SCHEMA EVOLUTION -->
+  <div class="panel" id="panel-5">
+    <h2>Schema Evolution</h2>
+    <p>What happens when your source adds a column, removes one, or renames a field?</p>
+
+    <!-- ════════════════════════════════════════════ -->
+    <h3>Summary — three approaches compared</h3>
+
+    <table>
+      <tr>
+        <th>Scenario</th>
+        <th>Declarative Pipeline<br>+ explicit schema from config<br><em style="font-weight:normal;color:#2EA44F;">(approach used here)</em></th>
+        <th>Declarative Pipeline<br>+ Auto Loader schema inference</th>
+        <th>Plain notebook<br>(spark.readStream &rarr; writeStream)</th>
+      </tr>
+      <tr>
+        <td><strong>Add a column</strong></td>
+        <td style="background:#F0FAF0;">Incremental &mdash; update <span class="ic">sources.yml</span>, redeploy, no full refresh needed</td>
+        <td style="background:#FFF0EE;">Full refresh required &mdash; new data goes to <span class="ic">_rescued_data</span></td>
+        <td style="background:#F0FAF0;">Automatic &mdash; <span class="ic">addNewColumns</span> + <span class="ic">mergeSchema</span></td>
+      </tr>
+      <tr>
+        <td><strong>Remove a column</strong></td>
+        <td style="background:#F0FAF0;">No action &mdash; column becomes NULL</td>
+        <td style="background:#F0FAF0;">No action &mdash; column becomes NULL</td>
+        <td style="background:#F0FAF0;">No action &mdash; column becomes NULL</td>
+      </tr>
+      <tr>
+        <td><strong>Rename a column</strong></td>
+        <td style="background:#FFF0EE;">Full refresh + upstream must change field name</td>
+        <td style="background:#FFF0EE;">Full refresh + upstream must change field name</td>
+        <td style="background:#FFF0EE;">Manual code change (<span class="ic">COALESCE</span> / alias)</td>
+      </tr>
+      <tr>
+        <td><strong>SQL <span class="ic">ALTER TABLE RENAME COLUMN</span></strong></td>
+        <td style="background:#FFF0EE;" colspan="2">Not supported on streaming tables</td>
+        <td style="background:#F0FAF0;">Supported (you own the table)</td>
+      </tr>
+    </table>
+
+    <div class="callout callout-green">
+      <strong>Why Declarative Pipeline + explicit schema handles add-column better</strong>
+      Standard Declarative Pipelines use Auto Loader schema inference &mdash; the table schema is fixed at creation and new columns land in <span class="ic">_rescued_data</span>.
+      Our pipeline uses an <strong>explicit schema from config</strong> (<span class="ic">from_json(json_line, schema)</span>). When you update the schema in <span class="ic">sources.yml</span> and redeploy, the <span class="ic">from_json</span> parse includes the new column in the DataFrame, and Lakeflow evolves the streaming table schema automatically on the next incremental run.
+    </div>
+
+    <!-- ════════════════════════════════════════════ -->
+    <h2 style="margin-top:40px;">Adding a column (incremental, no full refresh)</h2>
+
+    <p>When upstream starts sending a new field:</p>
+    <ol>
+      <li>Add the new column to <span class="ic">sources.yml</span> &mdash; both in <span class="ic">schema</span> and <span class="ic">bronze_columns</span></li>
+      <li>Redeploy with <span class="ic">force_refresh=true</span> (reloads the config table)</li>
+      <li>Run the pipeline <strong>incrementally</strong> (no full refresh needed)</li>
+    </ol>
+    <p>The new column appears in the table immediately. Old rows have NULL, new rows have the value. No data loss.</p>
+
+    <h3>How it works</h3>
+<pre class="code"><code><span class="c"># ingest_and_decrypt.py — schema comes from config, not file inference</span>
+schema = StructType.fromDDL(props[<span class="s">"schema"</span>])  <span class="c"># updated schema includes the new column</span>
+
+@dlt.table(name=f<span class="s">"raw_{source_name}"</span>, temporary=True)
+<span class="k">def</span> create_raw():
+    <span class="k">return</span> (spark.readStream.format(<span class="s">"cloudFiles"</span>)
+        .load(raw_path)
+        .withColumn(<span class="s">"parsed"</span>, from_json(col(<span class="s">"json_line"</span>), schema))  <span class="c"># ← new column parsed here</span>
+        .select(<span class="s">"parsed.*"</span>, ...))</code></pre>
+    <p>Because we control the schema via config, Lakeflow sees the new column in the returned DataFrame and evolves the table automatically.</p>
+
+    <!-- ════════════════════════════════════════════ -->
+    <h2 style="margin-top:40px;">Renaming a column</h2>
+
+    <h3>SQL ALTER TABLE &mdash; not supported</h3>
+<pre class="code"><code><span class="k">ALTER TABLE</span> catalog.schema.bronze_my_source
+    <span class="k">RENAME COLUMN</span> old_name <span class="k">TO</span> new_name</code></pre>
+    <div class="callout callout-red">
+      <strong>Not supported on streaming tables</strong>
+      <span class="ic">[STREAMING_TABLE_OPERATION_NOT_ALLOWED.UNSUPPORTED_OPERATION]</span><br>
+      Declarative Pipeline streaming tables are managed by the pipeline framework. Direct DDL operations like <span class="ic">RENAME COLUMN</span> are blocked.
+    </div>
+
+    <h3>Config-only change &mdash; does not work either</h3>
+    <p>If you update <span class="ic">sources.yml</span> with the new column name but the source files still use the old name:</p>
+    <ul>
+      <li><span class="ic">from_json</span> looks for a JSON key matching the new name</li>
+      <li>The source files don't have that key &mdash; the column is <strong>all NULLs</strong></li>
+      <li>The old column name disappears from the schema</li>
+    </ul>
+
+    <h3>Correct approach</h3>
+    <ol>
+      <li><strong>Upstream changes the field name</strong> in the source data</li>
+      <li>Update <span class="ic">sources.yml</span> with the new name in <span class="ic">schema</span>, <span class="ic">bronze_columns</span>, and any <span class="ic">derived_joins.py</span> references</li>
+      <li>Run a <strong>full refresh</strong> of the pipeline (recreates all tables from scratch)</li>
+    </ol>
+
+    <div class="callout callout-blue">
+      <strong>A rename is a coordinated change</strong>
+      Column renames require both the data producer (upstream source) and the pipeline config to change simultaneously. This is expected for production systems &mdash; renames are breaking changes that should be planned.
+    </div>
+
+    <!-- ════════════════════════════════════════════ -->
+    <h2 style="margin-top:40px;">Declarative Pipeline + schema inference &mdash; for reference</h2>
+    <p>If you use a Declarative Pipeline <strong>without</strong> an explicit schema (relying on Auto Loader schema inference), the behaviour is different:</p>
+
+    <h3>Adding a column</h3>
+    <ul>
+      <li>Auto Loader puts the new field into <span class="ic">_rescued_data</span> (a JSON string). The pipeline doesn't break but the column is <strong>not added</strong> to the table.</li>
+      <li>You can extract values with <span class="ic">get_json_object(_rescued_data, '$.new_field')</span> as a workaround.</li>
+      <li>To get a proper typed column: update the schema definition + <strong>full refresh</strong>.</li>
+    </ul>
+
+    <h3>Removing a column</h3>
+    <ul>
+      <li>The column stays in the table with NULLs for new rows. No action needed.</li>
+    </ul>
+
+    <!-- ════════════════════════════════════════════ -->
+    <h2 style="margin-top:40px;">Plain notebooks &mdash; Auto Loader schema evolution</h2>
+    <p>If you use Auto Loader in a <strong>plain notebook</strong> (not Lakeflow), you manage everything yourself. This gives you the most control over schema evolution:</p>
+
+<pre class="code"><code><span class="c"># Plain notebook — Auto Loader with schema evolution enabled</span>
+(spark.readStream
+    .format(<span class="s">"cloudFiles"</span>)
+    .option(<span class="s">"cloudFiles.format"</span>, <span class="s">"csv"</span>)
+    .option(<span class="s">"cloudFiles.schemaLocation"</span>, checkpoint_path)       <span class="c"># you manage schema storage</span>
+    .option(<span class="s">"cloudFiles.schemaEvolutionMode"</span>, <span class="s">"addNewColumns"</span>) <span class="c"># auto-detect new columns</span>
+    .load(source_path)
+    .writeStream
+    .option(<span class="s">"checkpointLocation"</span>, checkpoint_path)              <span class="c"># you manage checkpoints</span>
+    .option(<span class="s">"mergeSchema"</span>, <span class="s">"true"</span>)                              <span class="c"># you tell Delta to accept changes</span>
+    .table(<span class="s">"bronze_customers"</span>)
+)</code></pre>
+
+    <table>
+      <tr><th>Option</th><th>Lakeflow manages it</th><th>Plain notebook</th></tr>
+      <tr><td><span class="ic">schemaLocation</span></td><td>Automatic</td><td>You provide it</td></tr>
+      <tr><td><span class="ic">schemaEvolutionMode</span></td><td>Automatic</td><td>You set it</td></tr>
+      <tr><td><span class="ic">checkpointLocation</span></td><td>Automatic</td><td>You manage it</td></tr>
+      <tr><td><span class="ic">mergeSchema</span></td><td>Automatic</td><td>You set <span class="ic">"true"</span></td></tr>
+      <tr><td><span class="ic">ALTER TABLE RENAME</span></td><td>Not supported</td><td>Supported</td></tr>
+    </table>
+
+    <p>In a plain notebook, <span class="ic">addNewColumns</span> detects new columns in files, restarts the stream, and adds them to the Delta table automatically. You also get <span class="ic">ALTER TABLE RENAME COLUMN</span> because you own the table directly.</p>
+
+    <!-- ════════════════════════════════════════════ -->
+    <h2 style="margin-top:40px;">Full comparison &mdash; when to use what</h2>
+
+    <table>
+      <tr><th>Aspect</th><th>Declarative Pipeline + explicit schema <em style="font-weight:normal;color:#2EA44F;">(used here)</em></th><th>Declarative Pipeline + schema inference</th><th>Plain notebook (readStream &rarr; writeStream)</th></tr>
+      <tr>
+        <td><strong>Add column</strong></td>
+        <td style="background:#F0FAF0;">Incremental (config update)</td>
+        <td style="background:#FFF0EE;">Full refresh</td>
+        <td style="background:#F0FAF0;">Automatic</td>
+      </tr>
+      <tr>
+        <td><strong>Remove column</strong></td>
+        <td style="background:#F0FAF0;">No action (NULL)</td>
+        <td style="background:#F0FAF0;">No action (NULL)</td>
+        <td style="background:#F0FAF0;">No action (NULL)</td>
+      </tr>
+      <tr>
+        <td><strong>Rename column</strong></td>
+        <td style="background:#FFF0EE;">Full refresh + upstream</td>
+        <td style="background:#FFF0EE;">Full refresh + upstream</td>
+        <td style="background:#F0FAF0;">SQL ALTER + code update</td>
+      </tr>
+      <tr>
+        <td>DQ expectations</td>
+        <td>Built-in</td>
+        <td>Built-in</td>
+        <td>Manual</td>
+      </tr>
+      <tr>
+        <td>Event log / lineage</td>
+        <td>Built-in</td>
+        <td>Built-in</td>
+        <td>Manual</td>
+      </tr>
+      <tr>
+        <td>Add a new source</td>
+        <td>YAML config (minutes)</td>
+        <td>New notebook code</td>
+        <td>New notebook code</td>
+      </tr>
+      <tr>
+        <td>Orchestration</td>
+        <td>Lakeflow manages</td>
+        <td>Lakeflow manages</td>
+        <td>You manage</td>
+      </tr>
+    </table>
+
+    <div class="callout callout-green">
+      <strong>Recommendation</strong>
+      Declarative Pipeline + explicit schema from config gives the best of both worlds: built-in monitoring, DQ expectations, and orchestration combined with incremental add-column support. Column renames remain a planned, coordinated change &mdash; which is appropriate for production data pipelines.
+    </div>
+
+    <!-- ════════════════════════════════════════════ -->
+    <h2 style="margin-top:40px;">Detecting schema drift</h2>
+    <p>Monitor the rescue column to know when new columns start arriving before your config is updated:</p>
+<pre class="code"><code><span class="c">-- Which tables have unexpected columns arriving?</span>
+<span class="k">SELECT</span>
+    <span class="s">'bronze_my_source'</span> <span class="k">AS</span> table_name,
+    COUNT(*) <span class="k">AS</span> rows_with_rescued_data,
+    collect_set(json_object_keys(_rescued_data)) <span class="k">AS</span> new_columns
+<span class="k">FROM</span> bronze_my_source
+<span class="k">WHERE</span> _rescued_data <span class="k">IS NOT NULL</span>
+    <span class="k">AND</span> _rescued_data != <span class="s">'{}'</span></code></pre>
+    <p>If this returns results, new columns are arriving that aren't in your <span class="ic">sources.yml</span> schema yet. Add them to the config and redeploy &mdash; no full refresh needed with our approach.</p>
+
   </div>
 
 </div>
