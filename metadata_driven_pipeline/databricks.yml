@@ -1,0 +1,100 @@
+# Metadata-Driven Pipeline — Databricks Asset Bundle
+#
+# Only 3 variables — the environment-level settings that change between dev/prod.
+# Everything else (sources, schemas, encryption, paths) lives in conf/sources.yml.
+#
+# Deploy:  databricks bundle deploy -t dev
+# Run:     databricks bundle run my_pipeline -t dev
+
+bundle:
+  name: metadata_driven_pipeline
+
+variables:
+  catalog:
+    default: my_catalog
+  config_schema:
+    default: my_demo
+  bronze_schema:
+    default: my_bronze
+
+resources:
+
+  pipelines:
+    lakeflow_pipeline:
+      name: my_lakeflow_pipeline
+      serverless: true
+      catalog: ${var.catalog}
+      target: ${var.bronze_schema}
+      libraries:
+        - notebook:
+            path: ./notebooks/pipeline/ingest_and_decrypt.py
+        - notebook:
+            path: ./notebooks/pipeline/bronze_tables.py
+        - notebook:
+            path: ./notebooks/pipeline/pdv_tables.py
+        - notebook:
+            path: ./notebooks/pipeline/derived_joins.py
+      configuration:
+        config_table: "${var.catalog}.${var.config_schema}.pipeline_config"
+
+  jobs:
+    my_pipeline:
+      name: my_pipeline
+      environments:
+        - environment_key: serverless
+          spec:
+            client: "1"
+      tasks:
+        - task_key: load_config
+          notebook_task:
+            notebook_path: ./notebooks/setup_config.py
+            base_parameters:
+              catalog: "${var.catalog}"
+              config_schema: "${var.config_schema}"
+              bronze_schema: "${var.bronze_schema}"
+              config_file: "sources.yml"
+              force_refresh: "false"
+          environment_key: serverless
+
+        - task_key: encrypt_staging_to_raw
+          depends_on:
+            - task_key: load_config
+          notebook_task:
+            notebook_path: ./notebooks/encrypt_staging_to_raw.py
+            base_parameters:
+              config_table: "${var.catalog}.${var.config_schema}.pipeline_config"
+          environment_key: serverless
+
+        - task_key: run_pipeline
+          depends_on:
+            - task_key: encrypt_staging_to_raw
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.lakeflow_pipeline.id}
+
+        - task_key: apply_column_masks
+          depends_on:
+            - task_key: run_pipeline
+          notebook_task:
+            notebook_path: ./notebooks/apply_column_masks.py
+            base_parameters:
+              config_table: "${var.catalog}.${var.config_schema}.pipeline_config"
+              bronze_schema: "${var.bronze_schema}"
+          environment_key: serverless
+
+targets:
+  dev:
+    default: true
+    workspace:
+      host: https://my-dev-workspace.cloud.databricks.com
+    variables:
+      catalog: dev_catalog
+      config_schema: my_demo
+      bronze_schema: my_bronze
+
+  prod:
+    workspace:
+      host: https://my-prod-workspace.cloud.databricks.com
+    variables:
+      catalog: prod_catalog
+      config_schema: my_prod
+      bronze_schema: my_bronze

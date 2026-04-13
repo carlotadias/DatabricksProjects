@@ -1,0 +1,83 @@
+# Pipeline — Source Configuration
+#
+# This file defines everything the pipeline needs:
+#   settings  → pipeline-level config (storage roots, encryption, access control)
+#   sources   → one block per data source (prefix, schema, columns, PII)
+#
+# All sources land in the same storage container but under different prefixes —
+# mirrors real-world S3 / ADLS layout where one container holds data from
+# multiple upstream systems, each in its own key prefix.
+#
+# Full paths are assembled at load time: staging_root/prefix, raw_root/prefix
+#
+# To add a new source: add a block under sources and redeploy.
+# To add a new property: just include it — the MAP accepts anything.
+
+settings:
+  volume: pipeline_data
+  staging_root: /Volumes/${catalog}/${config_schema}/pipeline_data/staging
+  raw_root: /Volumes/${catalog}/${config_schema}/pipeline_data/raw
+  ad_group: my-pii-authorized-group
+  # In production, use: dbutils.secrets.get(scope="my-keyvault-scope", key="encryption-key")
+  encryption_key: "0123456789abcdef0123456789abcdef"
+
+sources:
+
+  - name: orders
+    prefix: ecommerce/orders
+    format: json
+    schema: >
+      order_id STRING, customer_id STRING, customer_email STRING,
+      customer_name STRING, product STRING, quantity INT,
+      amount DOUBLE, currency STRING, order_date STRING, status STRING
+    bronze_columns:
+      - order_id
+      - customer_id
+      - product
+      - quantity
+      - amount
+      - currency
+      - order_date
+      - status
+    pii_columns:
+      - customer_email
+      - customer_name
+    join_key: order_id
+    pdv_table: pdv_orders
+
+  - name: shipments
+    prefix: ecommerce/shipments
+    format: json
+    schema: >
+      shipment_id STRING, order_id STRING, carrier STRING,
+      tracking_number STRING, shipped_date STRING,
+      delivered_date STRING, status STRING
+    bronze_columns:
+      - shipment_id
+      - order_id
+      - carrier
+      - tracking_number
+      - shipped_date
+      - delivered_date
+      - status
+
+  - name: support_tickets
+    prefix: ecommerce/support_tickets
+    format: json
+    schema: >
+      ticket_id STRING, customer_id STRING, customer_email STRING,
+      subject STRING, description STRING, priority STRING,
+      status STRING, created_at STRING, resolved_at STRING
+    bronze_columns:
+      - ticket_id
+      - customer_id
+      - subject
+      - priority
+      - status
+      - created_at
+      - resolved_at
+    pii_columns:
+      - customer_email
+      - description
+    join_key: ticket_id
+    pdv_table: pdv_support_tickets
