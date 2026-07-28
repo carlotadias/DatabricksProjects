@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aveva-pi-timeseries"
+version = "2.0.3"
+description = "AVEVA PI time-series connector for Spark — web_ids -> (web_id, timestamp, value)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["requests>=2.31"]
+# Deliberately NO dependency on aveva-pi-assetframework: this wheel is
+# self-contained (it vendors its own _http.py). Resolve WebIDs with that library
+# separately, then pass them in.
+
+[project.optional-dependencies]
+dev = ["build", "pytest"]
+
+[tool.setuptools]
+packages = ["aveva_pi_timeseries"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

@@ -1,0 +1,46 @@
+# Databricks Asset Bundle for the AVEVA PI connector.
+#
+# This bundle provisions a shared Unity Catalog Volume that the built wheels are
+# published to; scripts/deploy.sh builds the wheels and uploads them there so any
+# cluster or job can `pip install` them.
+#
+# ─── DO NOT EDIT config here ────────────────────────────────────────────────
+# The host + catalog/schema/volume are configured in ONE place: the CONFIG block
+# at the top of scripts/deploy.sh. It exports them as BUNDLE_VAR_* env vars, which
+# the ${var.*} references below pick up automatically. Editing the defaults here
+# would just be overridden at deploy time.
+# ────────────────────────────────────────────────────────────────────────────
+bundle:
+  name: aveva_pi_connector
+
+variables:
+  catalog:
+    description: UC catalog that holds the shared library volume
+    default: main
+  libs_schema:
+    description: UC schema for shared libraries
+    default: ops
+  libs_volume:
+    description: UC volume the wheels are published to
+    default: common_libs
+
+# If this bundle OWNS the schema/volume, uncomment to have it create them.
+# Otherwise create the volume once, out-of-band:
+#   databricks volumes create ${var.catalog} ${var.libs_schema} ${var.libs_volume} MANAGED
+#
+# resources:
+#   volumes:
+#     common_libs:
+#       catalog_name: ${var.catalog}
+#       schema_name: ${var.libs_schema}
+#       name: ${var.libs_volume}
+
+# No workspace.host here — the host is an auth concern, taken from the CLI profile
+# (deploy.sh passes PROFILE=<name>) or DATABRICKS_HOST. Keeping it out avoids a
+# second place to edit.
+targets:
+  dev:
+    mode: development
+    default: true
+  prod:
+    mode: production
