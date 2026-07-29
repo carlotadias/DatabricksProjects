@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aveva-pi-assetframework"
+version = "3.0.2"
+description = "AVEVA PI Web API thin client — one function per real API call (points, batch, asset framework)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["requests>=2.31"]
+# Independent of aveva-pi-timeseries (vendors its own _http.py).
+
+[project.optional-dependencies]
+dev = ["build", "pytest"]
+
+[tool.setuptools]
+packages = ["aveva_pi_assetframework"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
