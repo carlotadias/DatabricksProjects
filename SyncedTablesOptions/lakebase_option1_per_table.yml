@@ -1,0 +1,108 @@
+# =============================================================================
+# OPTION 1 — one pipeline per synced table (the default, and the simplest)
+#
+# Omit BOTH `new_pipeline_spec` and `existing_pipeline_id` and each synced table
+# creates and owns its own DLT pipeline. 4 tables here -> 4 pipelines.
+#
+#   deploy:  databricks bundle deploy -t dev        (single pass, no manual steps)
+#
+# Trade-off: refreshes are NOT mutually consistent. Each pipeline is triggered
+# separately, so the app can briefly see one table refreshed and another not. If
+# the app joins across these tables and that matters, use Option 2 or 3.
+#
+# See SYNCED_TABLE_PIPELINE_OPTIONS.md for the comparison.
+# =============================================================================
+
+# Pipeline IDs for the scheduled refresh below — collect them after the first
+# deploy (see the SCHEDULED REFRESH note at the bottom of this file).
+variables:
+  pipeline_id_customers:           {default: ""}
+  pipeline_id_consumption_daily:   {default: ""}
+  pipeline_id_consumption_monthly: {default: ""}
+  pipeline_id_insights:            {default: ""}
+
+resources:
+  postgres_synced_tables:
+    customers_sync:
+      synced_table_id: ${var.catalog_name}.esi.customers
+      source_table_full_name: ${var.catalog_name}.${var.gold_schema}.customers
+      branch: projects/${var.lakebase_project}/branches/${var.lakebase_branch}
+      postgres_database: ${var.lakebase_database}
+      primary_key_columns: [customer_id]
+      scheduling_policy: SNAPSHOT
+      create_database_objects_if_missing: true
+
+    consumption_daily_sync:
+      synced_table_id: ${var.catalog_name}.esi.consumption_daily
+      source_table_full_name: ${var.catalog_name}.${var.gold_schema}.consumption_daily
+      branch: projects/${var.lakebase_project}/branches/${var.lakebase_branch}
+      postgres_database: ${var.lakebase_database}
+      primary_key_columns: [customer_id, usage_date]
+      scheduling_policy: SNAPSHOT
+      create_database_objects_if_missing: true
+
+    consumption_monthly_sync:
+      synced_table_id: ${var.catalog_name}.esi.consumption_monthly
+      source_table_full_name: ${var.catalog_name}.${var.gold_schema}.consumption_monthly
+      branch: projects/${var.lakebase_project}/branches/${var.lakebase_branch}
+      postgres_database: ${var.lakebase_database}
+      primary_key_columns: [customer_id, month_start]
+      scheduling_policy: SNAPSHOT
+      create_database_objects_if_missing: true
+
+    insights_sync:
+      synced_table_id: ${var.catalog_name}.esi.insights
+      source_table_full_name: ${var.catalog_name}.${var.gold_schema}.insights
+      branch: projects/${var.lakebase_project}/branches/${var.lakebase_branch}
+      postgres_database: ${var.lakebase_database}
+      primary_key_columns: [customer_id, insight_id]
+      scheduling_policy: SNAPSHOT
+      create_database_objects_if_missing: true
+
+# =============================================================================
+# SCHEDULED REFRESH
+#
+# SNAPSHOT and TRIGGERED never self-refresh (only CONTINUOUS does), and there is
+# no schedule field on the synced table itself — so you schedule a job with a
+# `pipeline_task` per pipeline.
+#
+# With per-table pipelines that means FOUR tasks and four IDs to collect, which
+# you can only do after the first deploy:
+#
+#   databricks pipelines list-pipelines -o json \
+#     | jq -r '.[] | select(.name|test("Synced table")) | "\(.pipeline_id)  \(.name)"'
+#
+# Fill the variables below, then uncomment the job.
+#
+# ⚠️ The four pipelines run INDEPENDENTLY, so they finish at different times.
+# If the app joins across these tables it can briefly see one refreshed and
+# another not. If that matters, use Option 2 or 3 (one pipeline, one task, one
+# consistent run).
+# =============================================================================
+
+  jobs:
+    refresh_synced_tables:
+      name: refresh_synced_tables
+      schedule:
+        quartz_cron_expression: "0 0 2 * * ?"     # 02:00 daily
+        timezone_id: Europe/Dublin
+        pause_status: UNPAUSED
+      # No dependencies between tasks -> they run in parallel. Add `depends_on` to
+      # stagger them if you'd rather spread the load on the source.
+      tasks:
+        - task_key: refresh_customers
+          pipeline_task:
+            pipeline_id: ${var.pipeline_id_customers}
+            full_refresh: true          # SNAPSHOT = full replace
+        - task_key: refresh_consumption_daily
+          pipeline_task:
+            pipeline_id: ${var.pipeline_id_consumption_daily}
+            full_refresh: true
+        - task_key: refresh_consumption_monthly
+          pipeline_task:
+            pipeline_id: ${var.pipeline_id_consumption_monthly}
+            full_refresh: true
+        - task_key: refresh_insights
+          pipeline_task:
+            pipeline_id: ${var.pipeline_id_insights}
+            full_refresh: true
