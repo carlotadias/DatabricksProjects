@@ -3,6 +3,79 @@
 All notable changes to the AVEVA PI → Databricks connector.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## Truncation detection + window concurrency — timeseries [2.1.0]
+
+Fixes the three defects recorded in `KNOWN_ISSUES.md` #1-#4. **Behaviour changes** —
+re-run your own tests before upgrading a live pipeline.
+
+### Fixed: `recorded` silently lost data above `maxCount` (#1) — DATA LOSS
+
+`maxCount` is a per-stream ceiling that PI applies **silently**: it returns the first
+`maxCount` values with HTTP 200 and no error, so a truncated response was
+indistinguishable from a complete one. The connector emitted those rows, committed the
+watermark past the whole window, and the remainder was gone — 90% loss at 1 value/100ms,
+99.9% at 1/ms.
+
+`_read_window` now **counts the response** and, if any stream came back at the ceiling,
+re-reads the window as two halves (recursively, bounded by `PI_MAX_WINDOW_SPLITS = 12`).
+If a window still truncates when it cannot be split further, it **raises** rather than
+returning partial data. Measuring the response beats predicting the tag rate.
+
+### Fixed: `recorded` window sizing used an item count as seconds (#2)
+
+`span_cap = per_stream_cap` treated 3,000 *items* as 3,000 *seconds*, implicitly assuming
+1 value/sec/tag. Now converted via `assumed_values_per_second` (new option, default 1.0 —
+conservative, since too-wide windows are recovered by truncation detection while too-narrow
+ones only cost extra calls). Measure the real rate with § 1 of
+`notebooks/benchmark_fanout.py`.
+
+`interval` is also no longer used as a floor for `recorded`, where it has no meaning — it
+was preventing dense tags from being split below 60 s.
+
+### Fixed: `partition_concurrency` was inert (#3) — a regression since 2.0.0
+
+Two stacked causes: partition size == call size (so a task re-chunked to exactly one call
+and the `ThreadPoolExecutor` was never constructed), and the pool sat *inside* the serial
+window loop where it received a 1-item list. `_fetch` now flattens work across **both**
+axes — `windows × webid_batches` — so concurrency parallelises the axis that actually has
+many items: the sub-windows of a wide backfill/catch-up read. Submitted in bounded waves so
+a multi-thousand-window backfill does not hold every response in memory.
+
+⚠️ **`partition_concurrency` already defaulted to 8**, merely inert. Activating it means an
+unchanged `recorded` config now issues up to 8 concurrent calls per task instead of 1. Set
+it to `1` to keep the old load profile. Partition count and `webids_per_call` are unchanged,
+so Spark still parallelises tags across machines exactly as before — steady-state cycles
+(one window) are unaffected either way.
+
+### Removed: `max_advance_seconds` (#4)
+
+Dead since 2.0.0 — assigned, never read. `latestOffset` returns `now_epoch()`
+unconditionally and a wide first batch is bounded by `_time_windows` instead. Passing the
+option is harmless but has no effect; remove it from job parameters.
+
+### Tests
+
+23 unit tests (was 15), offline. New coverage: truncation detected and re-read as
+contiguous halves; unsplittable truncation raises; no extra calls under the cap; `value`
+never treated as truncated; `recorded` span scales with the assumed rate; `interpolated`
+span still exact; every sub-window read exactly once, both concurrent and serial.
+
+## TLS verification toggle — timeseries [2.0.4], assetframework [3.0.2]
+
+Add a **`verify_tls`** option (default `true`) so the connector can talk to a PI
+server whose **internal / self-signed CA** isn't yet in the cluster trust store.
+
+- **timeseries connector:** `.option("verify_tls", "false")`.
+- **assetframework library:** `verify_tls=False` kwarg on every primitive.
+- Threaded through the shared `session()` → sets `requests` `session.verify` and
+  silences the `InsecureRequestWarning` when off.
+- **Diagnostic only.** `false` disables cert + hostname validation, exposing the
+  reusable Basic credential to MITM. The proper fix is to import the CA and keep
+  verification on. It fixes *certificate* errors only — not DNS resolution of the
+  PI FQDN from the cluster.
+- Mirrors the `verify_tls` widget in the customer's own `basic_auth_probe`-style
+  test, so a connector run matches what that test already proved.
+
 ## HTTP Basic auth — timeseries [2.0.3], assetframework [3.0.1]
 
 Make **HTTP Basic** the connector's PI authentication scheme, across both packages

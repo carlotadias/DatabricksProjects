@@ -13,8 +13,8 @@ library. The library gives you thin PI Web API primitives to produce the WebIDs
 the connector consumes. Install whichever you need — or both.
 
 ```bash
-pip install aveva_pi_assetframework-3.0.1-py3-none-any.whl   # the thin API client
-pip install aveva_pi_timeseries-2.0.3-py3-none-any.whl        # the Spark connector
+pip install aveva_pi_assetframework-3.0.2-py3-none-any.whl   # the thin API client
+pip install aveva_pi_timeseries-2.1.0-py3-none-any.whl        # the Spark connector
 ```
 
 The usual flow is **resolve IDs (client), then read (connector)**:
@@ -73,6 +73,14 @@ documented server limits.
 11. [Testing & benchmarking](#testing--benchmarking)
 12. [Troubleshooting](#troubleshooting)
 
+> ⚠️ **On timeseries ≤ 2.0.4, upgrade before a customer run.** Those versions silently lose
+> `recorded` data above `maxCount` (HTTP 200, no error) and `partition_concurrency` does
+> nothing at all. **2.1.0** detects truncation and re-reads, and makes the concurrency knob
+> work — see [CHANGELOG.md](CHANGELOG.md) for the behaviour changes and
+> [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the reasoning plus the one issue still open.
+> `§ 1` of `notebooks/benchmark_fanout.py` measures the tag density that decides how to set
+> `webids_per_call` and `assumed_values_per_second`.
+
 ---
 
 ## What's in this folder
@@ -83,13 +91,14 @@ wheel), plus shared docs/notebooks:
 ```
 aveva-pi-connector/
 ├── README.md · HOW_TO_USE.md · CHANGELOG.md   ← shared docs
+├── KNOWN_ISSUES.md                    ← defect history + the one issue still open
 │
 ├── auth/                             ← Basic-auth feasibility probe + runbook (self-contained)
 │   ├── AUTH_RUNBOOK.md               ←   how to run the probe + read the result
 │   └── basic_auth_probe.py           ←   does Basic work from Databricks over the PI FQDN?
 │
 ├── timeseries/                       ← PACKAGE 1: the Spark connector
-│   ├── pyproject.toml                ←   → wheel: aveva_pi_timeseries-2.0.3
+│   ├── pyproject.toml                ←   → wheel: aveva_pi_timeseries-2.1.0
 │   ├── src/aveva_pi_timeseries/
 │   │   ├── __init__.py               ←   public API: PITimeSeriesSource
 │   │   ├── reader.py                 ←   the DataSource: web_ids → (web_id, timestamp, value)
@@ -97,7 +106,7 @@ aveva-pi-connector/
 │   └── tests/test_timeseries.py
 │
 ├── assetframework/                   ← PACKAGE 2: the thin PI Web API client
-│   ├── pyproject.toml                ←   → wheel: aveva_pi_assetframework-3.0.1
+│   ├── pyproject.toml                ←   → wheel: aveva_pi_assetframework-3.0.2
 │   ├── src/aveva_pi_assetframework/
 │   │   ├── __init__.py               ←   public API: get_point, batch, get_*_elements, …
 │   │   ├── client.py                 ←   one thin function per real PI Web API call
@@ -266,17 +275,18 @@ Verified against the official PI Web API 2023 SP2 reference; encoded in
 |--------|---------|-------------|
 | `endpoint_url` | *(required)* | PI Web API base, `https://<host>/piwebapi` |
 | `basic_user` / `basic_password` | *(required)* | HTTP Basic auth against PI. Sent pre-emptively, so it works even if PI advertises only `Negotiate`. **Use a secret store** + a dedicated read-only account. |
+| `verify_tls` | `true` | Validate PI's TLS certificate. Set `false` **only as a diagnostic** against an internal-CA / self-signed PI before its CA is in the cluster trust store — it disables cert + hostname checks and exposes the Basic credential to MITM. Prefer importing the CA. |
 | `web_ids` | *(required)* | Comma-separated PI WebIDs (resolve names via the `aveva_pi_assetframework` client — `get_point` / `batch`). |
 | `read_mode` | `value` | `value` \| `interpolated` \| `recorded` \| `recordedattime` |
 | `interval` | `1m` | Sampling interval for `interpolated` |
 | `as_of` | — | Timestamp — required for `recordedattime` (batch only) |
 | `max_count` | `10000` | Per-stream row cap (clamped under the 150k ceiling) |
 | `webids_per_call` | `50` | WebIDs per StreamSet call / Spark partition |
-| `partition_concurrency` | `8` | In-partition thread-pool size |
+| `partition_concurrency` | `8` | Calls in flight per task. Only bites when a task has >1 call — a wide `recorded` read. **Inert before 2.1.0.** |
 | `bulk_read` | `true` | `true` = StreamSet bulk; `false` = one call per WebID |
 | `lookback_seconds` | `3600` | Window when no `initial_watermark` |
 | `initial_watermark` | — | ISO start; **naive = UTC**, e.g. `2026-01-01T00:00:00` |
-| `max_advance_seconds` | `300` | Max seconds a streaming micro-batch advances |
+| `assumed_values_per_second` | `1.0` | Sizes `recorded` windows (2.1.0+). Measure the real rate with § 1 of the benchmark. |
 | `http_timeout_seconds` | `60` | Per-request timeout |
 
 ---
@@ -359,8 +369,8 @@ Each package builds + tests on its own:
 ### Install on a cluster
 Install whichever you need (usually both):
 ```bash
-pip install /Volumes/<catalog>/<schema>/<volume>/aveva_pi_assetframework-3.0.1-py3-none-any.whl
-pip install /Volumes/<catalog>/<schema>/<volume>/aveva_pi_timeseries-2.0.3-py3-none-any.whl
+pip install /Volumes/<catalog>/<schema>/<volume>/aveva_pi_assetframework-3.0.2-py3-none-any.whl
+pip install /Volumes/<catalog>/<schema>/<volume>/aveva_pi_timeseries-2.1.0-py3-none-any.whl
 ```
 
 ---
@@ -456,4 +466,4 @@ plain-English explanation of every option.
 
 ---
 
-**Versions** · `aveva_pi_timeseries` 2.0.3 · `aveva_pi_assetframework` 3.0.1 · each requires only `requests` at runtime.
+**Versions** · `aveva_pi_timeseries` 2.1.0 · `aveva_pi_assetframework` 3.0.2 · each requires only `requests` at runtime.

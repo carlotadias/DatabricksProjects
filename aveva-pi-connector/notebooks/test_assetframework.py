@@ -19,8 +19,14 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install /Volumes/<catalog>/<schema>/<volume>/aveva_pi_assetframework-3.0.1-py3-none-any.whl
-# MAGIC # ^ EDIT the Volume path to where you published it (this notebook needs ONLY the library)
+# MAGIC %pip install /Volumes/<catalog>/<schema>/<volume>/aveva_pi_assetframework-3.0.2-py3-none-any.whl
+# MAGIC # ^ OPTION A (wheel on a UC Volume) — EDIT the path to where you published it.
+# MAGIC #   This notebook needs ONLY the library.
+# MAGIC #
+# MAGIC # OPTION B (no build/publish needed) — install straight from the cloned repo.
+# MAGIC # Comment out the line above, uncomment this, and fix the path to your Git folder
+# MAGIC # (check the sidebar; it's usually /Workspace/Users/<you>/... or /Workspace/Repos/<you>/...):
+# MAGIC # %pip install /Workspace/Users/<you>/DatabricksProjects/aveva-pi-connector/assetframework
 dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -32,6 +38,11 @@ BASE         = ENDPOINT_URL.rstrip("/")
 SCOPE          = "pi"            # EDIT — Databricks secret scope
 BASIC_USER_KEY = "pi_user"      # EDIT — secret keys for HTTP Basic against PI
 BASIC_PW_KEY   = "pi_password"
+
+# --- Connectivity (see the preflight cell below) --------------------------------
+FALLBACK_IP = ""       # EDIT e.g. "10.0.0.5" if the cluster can't resolve the FQDN
+                       #   (SINGLE-NODE clusters only — pins FQDN->IP in /etc/hosts)
+VERIFY_TLS  = True     # keep True; set False as a diagnostic for an internal-CA PI
 
 TAGS = [
     # EDIT — a few real tag names on PI_SERVER, e.g.:
@@ -50,12 +61,15 @@ from aveva_pi_assetframework import (
 print("aveva_pi_assetframework", __version__)
 
 # Auth — HTTP Basic against PI (secret-scope keys, never literals).
+# verify_tls goes in AUTH so it reaches session() on every **AUTH call.
 AUTH = dict(basic_user=dbutils.secrets.get(SCOPE, BASIC_USER_KEY),
-            basic_password=dbutils.secrets.get(SCOPE, BASIC_PW_KEY))
+            basic_password=dbutils.secrets.get(SCOPE, BASIC_PW_KEY),
+            verify_tls=VERIFY_TLS)
 
 # One pooled Basic session reused across the primitive calls (same creds as AUTH).
 SESS = requests.Session()
 SESS.auth = requests.auth.HTTPBasicAuth(AUTH["basic_user"], AUTH["basic_password"])
+SESS.verify = VERIFY_TLS
 
 _results = []
 def check(name, ok, detail=""):
@@ -63,6 +77,64 @@ def check(name, ok, detail=""):
     print(f"{'✅ PASS' if ok else '❌ FAIL'}  {name}" + (f"  — {detail}" if detail else ""))
 
 assert TAGS, "Set TAGS (a few real tag names on PI_SERVER) before running."
+
+# --- Connectivity preflight — route + DNS; optional /etc/hosts pin --------------
+# ⚠️ SINGLE-NODE CLUSTERS ONLY (writes the driver's hosts file). Pinning keeps you
+# dialing the FQDN so the TLS cert still matches. Multi-node: use scripts/pi_dns_init.sh.
+import socket as _socket, time as _time
+from urllib.parse import urlparse as _urlparse
+_host = _urlparse(ENDPOINT_URL).hostname
+_port = _urlparse(ENDPOINT_URL).port or 443
+
+# DNS with retries — absorbs the transient EAI_AGAIN this environment has shown.
+def _resolve(host, tries=3):
+    for _i in range(tries):
+        try:
+            return _socket.gethostbyname(host)
+        except _socket.gaierror:
+            if _i < tries - 1:
+                _time.sleep(1.5)
+    raise
+
+try:
+    _ip = FALLBACK_IP or _resolve(_host)
+    _socket.create_connection((_ip, _port), timeout=5).close()
+    print(f"✅ route OK — reached {_ip}:{_port}")
+except Exception as _e:
+    print(f"❌ cannot reach PI ({_e!r}). A timeout = blocked network path (escalate); "
+          f"a name-resolution error = DNS (set FALLBACK_IP below).")
+try:
+    _resolve(_host); print(f"✅ DNS resolves {_host}")
+except Exception:
+    if FALLBACK_IP:
+        with open("/etc/hosts") as _f:
+            _present = _host in _f.read()
+        if not _present:
+            with open("/etc/hosts", "a") as _f:
+                _f.write(f"{FALLBACK_IP}  {_host}\n")
+        print(f"📌 pinned {_host} -> {FALLBACK_IP} in /etc/hosts (single-node only)")
+    else:
+        print(f"❌ DNS can't resolve {_host}; set FALLBACK_IP (single-node) or use the init script")
+
+# TLS trust probe — flip verify off ONLY on a genuine cert-trust error (internal CA).
+if VERIFY_TLS:
+    import ssl as _ssl
+    try:
+        _ctx = _ssl.create_default_context()
+        with _socket.create_connection((_host, _port), timeout=5) as _raw:
+            with _ctx.wrap_socket(_raw, server_hostname=_host):
+                pass
+        print(f"✅ TLS cert trusted for {_host} — keeping verify_tls=True")
+    except _ssl.SSLCertVerificationError as _e:
+        VERIFY_TLS = False
+        AUTH["verify_tls"] = False          # reaches session() on every **AUTH call
+        SESS.verify = False                  # the pooled session used by the AF-walk cell
+        print(f"⚠️  TLS cert NOT trusted ({_e.verify_message or _e}). Likely an internal CA. "
+              f"→ verify_tls set to FALSE for this diagnostic run. "
+              f"Production: import the PI/enterprise CA into the cluster trust store.")
+    except Exception as _e:
+        print(f"ℹ️  TLS probe inconclusive ({_e!r}) — leaving verify_tls=True.")
+print(f"verify_tls for this run: {VERIFY_TLS}")
 
 # COMMAND ----------
 

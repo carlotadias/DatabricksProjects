@@ -41,5 +41,5 @@ for pkg in timeseries assetframework; do
   echo "    published $(basename "$WHEEL")"
 done
 echo "==> done. Install on clusters via:"
-echo "    pip install ${VOLUME_PATH}/aveva_pi_assetframework-3.0.1-py3-none-any.whl"
-echo "    pip install ${VOLUME_PATH}/aveva_pi_timeseries-2.0.3-py3-none-any.whl"
+echo "    pip install ${VOLUME_PATH}/aveva_pi_assetframework-3.0.2-py3-none-any.whl"
+echo "    pip install ${VOLUME_PATH}/aveva_pi_timeseries-2.0.4-py3-none-any.whl"

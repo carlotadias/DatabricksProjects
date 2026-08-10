@@ -193,3 +193,185 @@ def test_reader_threads_basic_auth(monkeypatch):
                                      "basic_user": "DOMAIN\\svc-pi", "basic_password": "pw"})
     list(rdr.read(rdr.partitions()[0]))
     assert captured.get("basic_user") == "DOMAIN\\svc-pi" and captured.get("basic_password") == "pw"
+
+
+def test_session_verify_tls():
+    # default verifies; verify_tls=False turns off session.verify
+    assert h.session(None, None).verify is True
+    assert h.session(None, None, verify_tls=False).verify is False
+
+
+def test_reader_threads_verify_tls(monkeypatch):
+    # option verify_tls=false reaches session() through the reader (default is true)
+    captured = {}
+    real_session = h.session
+    def spy(*a, **k):
+        captured.update(k)
+        return real_session(*a, **k)
+    monkeypatch.setattr(h, "session", spy)
+    monkeypatch.setattr(r, "session", spy)
+    monkeypatch.setattr(r, "request_json", lambda *a, **k: {"Items": []})
+    rdr = r.PITimeSeriesBatchReader({**OPTS, "read_mode": "value", "verify_tls": "false"})
+    list(rdr.read(rdr.partitions()[0]))
+    assert captured.get("verify_tls") is False
+    # default: absent option -> verifies
+    captured.clear()
+    rdr2 = r.PITimeSeriesBatchReader({**OPTS, "read_mode": "value"})
+    list(rdr2.read(rdr2.partitions()[0]))
+    assert captured.get("verify_tls") is True
+
+
+
+# --------------------------------------------------------------------------- #
+# Truncation detection (KNOWN_ISSUES #1/#2) — PI applies maxCount SILENTLY, so a
+# full response is indistinguishable from a complete one except by counting.
+#
+# These drive _WebIdChunkPartition directly rather than via partitions(), so the
+# window span is EXACT: initial_watermark would run to now(), i.e. months.
+# --------------------------------------------------------------------------- #
+
+def _recorded_reader(**over):
+    """A `recorded` reader; 50 tags in one call."""
+    return r.PITimeSeriesBatchReader({
+        "endpoint_url": "http://pi/piwebapi",
+        "web_ids": ",".join(f"W{i}" for i in range(50)),
+        "read_mode": "recorded", "webids_per_call": "50",
+        "initial_watermark": "2026-01-01T00:00:00", **over})
+
+
+def _part(rdr, start, end):
+    return r._WebIdChunkPartition(tuple(rdr._web_ids), start, end)
+
+
+def _values(n):
+    return [{"Timestamp": "2026-01-01T00:00:%02dZ" % (i % 60), "Value": float(i)}
+            for i in range(n)]
+
+
+def test_truncation_detected_and_window_split(monkeypatch):
+    """A response at exactly maxCount must trigger a re-read as two halves."""
+    spans = []
+
+    def router(method, url, params, body):
+        p = dict(params)
+        spans.append((p["startTime"], p["endTime"]))
+        cap = int(p["maxCount"])
+        # The full window comes back FULL (= truncated); the halves do not.
+        return {"Items": [{"WebId": "W0",
+                           "Items": _values(cap if len(spans) == 1 else 3)}]}
+
+    _patch(monkeypatch, router)
+    rdr = _recorded_reader(max_count="10")
+    rows = list(rdr._fetch(_part(rdr, 0, 10)))       # 10s: one window, then split
+    assert len(spans) == 3, spans                     # 1 truncated + 2 halves
+    assert spans[1][0] == spans[0][0]                 # first half keeps the start
+    assert spans[2][1] == spans[0][1]                 # second half keeps the end
+    assert spans[1][1] == spans[2][0]                 # contiguous — no gap, no overlap
+    assert len(rows) == 6                             # 3 + 3 from the halves
+
+
+def test_truncation_raises_when_unsplittable(monkeypatch):
+    """Always-truncated reads must RAISE, never silently drop the remainder."""
+    def router(method, url, params, body):
+        cap = int(dict(params)["maxCount"])
+        return {"Items": [{"WebId": "W0", "Items": _values(cap)}]}   # always full
+
+    _patch(monkeypatch, router)
+    import pytest
+    rdr = _recorded_reader(max_count="10")
+    with pytest.raises(RuntimeError, match="truncated"):
+        list(rdr._fetch(_part(rdr, 0, 64)))
+
+
+def test_no_truncation_no_extra_calls(monkeypatch):
+    """Under the cap, behaviour is unchanged — one call, no splitting."""
+    calls = []
+
+    def router(method, url, params, body):
+        calls.append(params)
+        return {"Items": [{"WebId": "W0", "Items": _values(2)}]}
+
+    _patch(monkeypatch, router)
+    rdr = _recorded_reader(max_count="1000")
+    rows = list(rdr._fetch(_part(rdr, 0, 10)))
+    assert len(calls) == 1 and len(rows) == 2
+
+
+def test_value_mode_never_treated_as_truncated(monkeypatch):
+    """`value` returns one snapshot per stream; maxCount does not apply."""
+    calls = []
+
+    def router(method, url, params, body):
+        calls.append(params)
+        return {"Items": [{"WebId": "W-1",
+                           "Value": {"Timestamp": "2026-01-01T00:00:00Z", "Value": 1.0}}]}
+
+    _patch(monkeypatch, router)
+    rdr = r.PITimeSeriesBatchReader({**OPTS, "read_mode": "value"})
+    rows = [row for p in rdr.partitions() for row in rdr.read(p)]
+    assert len(rows) == 1 and len(calls) == 1          # no split attempted
+
+
+# --------------------------------------------------------------------------- #
+# Window sizing (KNOWN_ISSUES #2) — the item count must be converted to seconds
+# via an assumed rate, not used directly AS seconds.
+# --------------------------------------------------------------------------- #
+
+def test_recorded_span_scales_with_assumed_rate(monkeypatch):
+    _patch(monkeypatch, _streamset_router({"Items": []}))
+    slow = _recorded_reader(assumed_values_per_second="1", max_count="3000")
+    fast = _recorded_reader(assumed_values_per_second="100", max_count="3000")
+    day = 86_400
+    n_slow = len(slow._time_windows(0, day, 50))
+    n_fast = len(fast._time_windows(0, day, 50))
+    # A 100x denser archive must be split into ~100x more windows. Previously the item
+    # count was used AS seconds, so the rate had no effect at all and these were equal.
+    assert n_fast >= n_slow * 50, (n_slow, n_fast)
+
+
+def test_interpolated_span_uses_interval_exactly(monkeypatch):
+    """interpolated CAN be exact: items x interval = duration. Unchanged behaviour."""
+    _patch(monkeypatch, _streamset_router({"Items": []}))
+    rdr = _recorded_reader(read_mode="interpolated", interval="1m", max_count="100")
+    # cap=100 items x 60s = 6000s per window, so 12000s needs 2 windows.
+    assert len(rdr._time_windows(0, 12_000, 50)) == 2
+
+
+# --------------------------------------------------------------------------- #
+# partition_concurrency (KNOWN_ISSUES #3) — the pool must now see the WINDOW axis.
+# Before the fix the pool sat INSIDE the window loop and got a 1-item list, so it
+# was never constructed for bulk reads.
+# --------------------------------------------------------------------------- #
+
+def test_concurrency_parallelises_windows(monkeypatch):
+    """Every sub-window must be read exactly once, concurrently."""
+    seen = []
+
+    def router(method, url, params, body):
+        p = dict(params)
+        seen.append((p["startTime"], p["endTime"]))
+        return {"Items": [{"WebId": "W0", "Items": _values(1)}]}
+
+    _patch(monkeypatch, router)
+    # cap 10 items at 1/s -> 10s windows; a 100s span is 10 windows in ONE task.
+    rdr = _recorded_reader(max_count="10", assumed_values_per_second="1",
+                           partition_concurrency="4")
+    rows = list(rdr._fetch(_part(rdr, 0, 100)))
+    assert len(seen) == 10, seen                       # all windows read, none skipped
+    assert len(set(seen)) == 10                        # none read twice
+    assert len(rows) == 10
+
+
+def test_windows_serial_when_concurrency_one(monkeypatch):
+    """concurrency=1 keeps the sequential path and the same coverage."""
+    seen = []
+
+    def router(method, url, params, body):
+        seen.append((dict(params)["startTime"], dict(params)["endTime"]))
+        return {"Items": [{"WebId": "W0", "Items": _values(1)}]}
+
+    _patch(monkeypatch, router)
+    rdr = _recorded_reader(max_count="10", assumed_values_per_second="1",
+                           partition_concurrency="1")
+    list(rdr._fetch(_part(rdr, 0, 100)))
+    assert len(seen) == 10 and len(set(seen)) == 10

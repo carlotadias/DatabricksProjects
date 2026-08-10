@@ -114,7 +114,7 @@ def test_public_surface_is_primitives_only():
     # the removed orchestration helpers must NOT be re-exported
     for gone in ("resolve_webids", "discover_af", "PIPointsSource", "POINTS_SCHEMA"):
         assert not hasattr(af, gone), f"{gone} should have been removed"
-    assert af.__version__ == "3.0.1"
+    assert af.__version__ == "3.0.2"
 
 
 def test_get_point_threads_basic_auth(monkeypatch):
@@ -129,3 +129,17 @@ def test_get_point_threads_basic_auth(monkeypatch):
     monkeypatch.setattr(c, "request_json", lambda *a, **k: {"WebId": "W1"})
     af.get_point(BASE, "PISRV", "Plant.A.U1.Temp", basic_user="DOMAIN\\svc-pi", basic_password="pw")
     assert captured.get("basic_user") == "DOMAIN\\svc-pi" and captured.get("basic_password") == "pw"
+
+
+def test_get_point_threads_verify_tls(monkeypatch):
+    # verify_tls=False on a client call reaches session()
+    captured = {}
+    real_session = h.session
+    def spy(*a, **k):
+        captured.update(k)
+        return real_session(*a, **k)
+    monkeypatch.setattr(h, "session", spy)
+    monkeypatch.setattr(c, "session", spy)
+    monkeypatch.setattr(c, "request_json", lambda *a, **k: {"WebId": "W1"})
+    af.get_point(BASE, "PISRV", "Plant.A.U1.Temp", basic_user="u", basic_password="pw", verify_tls=False)
+    assert captured.get("verify_tls") is False

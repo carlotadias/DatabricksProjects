@@ -118,7 +118,7 @@ except Exception as e:
 # COMMAND ----------
 
 PI_SERVER = "PISRV"                              # EDIT: PI Data Archive server name
-TEST_TAG  = "SSE.THERM.KEA.GT1.EXHAUST_TEMP"     # EDIT: any real tag
+TEST_TAG  = "Plant.Area.Unit1.Temp"              # EDIT: any real tag
 from urllib.parse import quote
 try:
     user = dbutils.secrets.get(SCOPE, USER_KEY); pw = dbutils.secrets.get(SCOPE, PASS_KEY)

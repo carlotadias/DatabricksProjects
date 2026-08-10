@@ -43,10 +43,12 @@ from pyspark.sql.datasource import (
 from pyspark.sql.types import DoubleType, StringType, StructField, StructType, TimestampType
 
 from ._http import (
+    PI_ASSUMED_VALUES_PER_SECOND,
     PI_DEFAULT_MAX_COUNT,
     PI_DEFAULT_PARTITION_CONCURRENCY,
     PI_DEFAULT_WEBIDS_PER_CALL,
     PI_MAX_RETURNED_ITEMS,
+    PI_MAX_WINDOW_SPLITS,
     chunk,
     iso,
     now_epoch,
@@ -132,6 +134,7 @@ class _PITimeSeriesMixin:
         self._api_key = options.get("api_key")
         self._basic_user = options.get("basic_user")
         self._basic_password = options.get("basic_password")
+        self._verify_tls = (options.get("verify_tls", "true").lower() != "false")
         self._web_ids = _web_ids(options)
         if not self._web_ids:
             raise ValueError("aveva_pi_timeseries requires the 'web_ids' option "
@@ -139,7 +142,11 @@ class _PITimeSeriesMixin:
                              "aveva-pi-assetframework library)")
         self._interval = options.get("interval", "1m")
         self._interval_s = _interval_seconds(self._interval)
-        self._max_advance = int(options.get("max_advance_seconds", "300"))
+        # NOTE: `max_advance_seconds` is deliberately NOT read. v0.x used it to pace
+        # latestOffset; v2's latestOffset returns now_epoch() unconditionally and a wide
+        # first batch is instead bounded by _time_windows. Accepting the option while
+        # ignoring it would imply pacing that does not happen, so it is gone — callers
+        # passing it are harmless (unknown options are ignored) but get no effect.
         self._lookback = int(options.get("lookback_seconds", "3600"))
         self._timeout = int(options.get("http_timeout_seconds", "60"))
         self._initial_watermark = options.get("initial_watermark")
@@ -149,6 +156,10 @@ class _PITimeSeriesMixin:
         self._concurrency = int(options.get("partition_concurrency",
                                             str(PI_DEFAULT_PARTITION_CONCURRENCY)))
         self._bulk_read = (options.get("bulk_read", "true").lower() != "false")
+        # Only used to SIZE `recorded` windows up front; truncation detection corrects an
+        # over-optimistic value at read time, so this is a starting estimate, not a contract.
+        self._assumed_vps = float(options.get("assumed_values_per_second",
+                                              str(PI_ASSUMED_VALUES_PER_SECOND)))
         self._read_mode = (options.get("read_mode") or "value").lower()
         if self._read_mode not in _READ_MODES:
             raise ValueError(f"read_mode must be one of {sorted(_READ_MODES)}")
@@ -163,15 +174,29 @@ class _PITimeSeriesMixin:
 
     def _time_windows(self, start_ts: int, end_ts: int, n_streams: int) -> list[tuple]:
         """Split [start, end] into half-open sub-windows sized so a single call
-        stays under MaxReturnedItemsPerCall across all streams in the chunk."""
+        stays under MaxReturnedItemsPerCall across all streams in the chunk.
+
+        This is a PREDICTION of how much data a span holds, and only `interpolated` can
+        make it exactly (items x interval = duration). `recorded` has no interval, so the
+        span is derived from an assumed archive rate — see PI_ASSUMED_VALUES_PER_SECOND.
+        Getting it wrong is not fatal in either direction: too wide is caught by
+        truncation detection in `_read_window` and re-read as halves, too narrow only
+        costs extra calls.
+        """
         if self._read_mode in _POINT_IN_TIME or end_ts <= start_ts:
             return [(start_ts, end_ts)]
         per_stream_cap = min(self._max_count, max(1, PI_MAX_RETURNED_ITEMS // max(1, n_streams)))
         if self._read_mode == "interpolated":
             span_cap = per_stream_cap * self._interval_s
-        else:  # recorded — bound the window span heuristically by the cap
-            span_cap = per_stream_cap
-        span_cap = max(self._interval_s, span_cap)
+            # A window narrower than one interval would return nothing useful.
+            span_cap = max(self._interval_s, span_cap)
+        else:
+            # recorded: cap is an ITEM count, so convert to seconds via the assumed rate.
+            # Previously the item count was used directly AS seconds, which silently
+            # assumed 1 value/sec/tag and under-split at any higher density.
+            # `interval` is NOT a floor here — it has no meaning for raw archive reads,
+            # and applying it stopped dense tags from being split below 60s.
+            span_cap = max(1, int(per_stream_cap / max(1e-9, self._assumed_vps)))
         windows = []
         s = start_ts
         while s < end_ts:
@@ -203,6 +228,25 @@ class _PITimeSeriesMixin:
                        ("interval", self._interval)]
         return url, params
 
+    def _truncated_streams(self, body: dict, max_count: int) -> list[str]:
+        """WebIDs whose item count reached `max_count` — i.e. PI truncated the response.
+
+        maxCount is a per-stream CEILING, and PI applies it silently: it returns the first
+        `max_count` values with HTTP 200 and no error, so a full response is
+        indistinguishable from a complete one except by counting. Anything at or above the
+        ceiling therefore means there is more data in this window than we asked for.
+        Detecting this beats predicting the tag rate up front, which is what
+        `_time_windows` has to do (and cannot do reliably — see its docstring).
+        """
+        if self._read_mode in _POINT_IN_TIME:
+            return []                    # one value per stream by definition
+        hit = []
+        for stream in body.get("Items", []) or []:
+            values = stream.get("Items")
+            if values is not None and len(values) >= max_count:
+                hit.append(stream.get("WebId"))
+        return hit
+
     def _emit_streamset(self, body: dict, start_ts: int, is_first_window: bool) -> Iterator[tuple]:
         """Yield (web_id, timestamp, value) from a StreamSet response, guarding
         WebException-on-200, half-open window boundaries, and missing/error items."""
@@ -223,29 +267,82 @@ class _PITimeSeriesMixin:
                     continue
                 yield (web_id, parse_ts(ts), _coerce_value(item.get("Value")))
 
+    def _read_window(self, s, web_ids: list[str], ws: int, we: int,
+                     is_first: bool, depth: int = 0) -> Iterator[tuple]:
+        """Read one [ws, we) window for `web_ids`, halving it if PI truncated.
+
+        `_time_windows` sizes windows by PREDICTING the tag rate, which it cannot do
+        reliably (for `recorded` it has no interval to work from). When that prediction is
+        too optimistic PI silently returns only `maxCount` values per stream, so we check
+        the response and re-read the window in two halves instead of dropping the
+        remainder. Measuring the response beats guessing the rate.
+
+        Bounded by `PI_MAX_WINDOW_SPLITS` so a pathological tag (or a window already down
+        to one second) cannot recurse forever; at the limit we raise rather than silently
+        return partial data.
+        """
+        max_count = self._per_stream_max_count(len(web_ids))
+        url, params = self._streamset_url_params(web_ids, ws, we)
+        body = request_json(s, "GET", url, params=params, timeout=self._timeout)
+
+        truncated = self._truncated_streams(body, max_count)
+        if truncated:
+            if depth >= PI_MAX_WINDOW_SPLITS or we - ws <= 1:
+                raise RuntimeError(
+                    f"PI truncated {len(truncated)} stream(s) at maxCount={max_count} for "
+                    f"window [{iso(ws)}, {iso(we)}) and it cannot be split further "
+                    f"(depth={depth}). Data would be silently lost. Reduce "
+                    f"webids_per_call (which raises the per-stream cap) or read a "
+                    f"narrower window. First affected WebID: {truncated[0]}")
+            mid = ws + (we - ws) // 2
+            # Re-read as two halves. The first half keeps this window's is_first flag so
+            # the half-open boundary dedup in _emit_streamset still behaves; the second
+            # half is never "first", since its start_ts is interior to the original span.
+            yield from self._read_window(s, web_ids, ws, mid, is_first, depth + 1)
+            yield from self._read_window(s, web_ids, mid, we, False, depth + 1)
+            return
+
+        yield from self._emit_streamset(body, ws, is_first)
+
     def _fetch(self, partition: _WebIdChunkPartition) -> Iterator[tuple]:
         s = session(self._bearer, self._api_key, pool_maxsize=max(self._concurrency, 8),
-                    basic_user=self._basic_user, basic_password=self._basic_password)
+                    basic_user=self._basic_user, basic_password=self._basic_password,
+                    verify_tls=self._verify_tls)
         web_ids = list(partition.web_ids)
         windows = self._time_windows(partition.start_ts, partition.end_ts, len(web_ids))
         webid_batches = chunk(web_ids, self._webids_per_call) if self._bulk_read \
             else [[w] for w in web_ids]
 
-        for wi, (ws, we) in enumerate(windows):
-            first = (wi == 0)
-            if self._concurrency <= 1 or len(webid_batches) <= 1:
-                for wc in webid_batches:
-                    url, params = self._streamset_url_params(wc, ws, we)
-                    body = request_json(s, "GET", url, params=params, timeout=self._timeout)
-                    yield from self._emit_streamset(body, ws, first)
-            else:
-                from concurrent.futures import ThreadPoolExecutor
-                def _one(wc, _ws=ws, _we=we):
-                    url, params = self._streamset_url_params(wc, _ws, _we)
-                    return request_json(s, "GET", url, params=params, timeout=self._timeout)
-                with ThreadPoolExecutor(max_workers=self._concurrency) as pool:
-                    for body in pool.map(_one, webid_batches):
-                        yield from self._emit_streamset(body, ws, first)
+        # Work spans BOTH axes: (window, webid batch). Windows used to be iterated
+        # serially with the pool nested inside, where it received a single batch and so
+        # never ran at all for bulk reads. Flattening lets `partition_concurrency`
+        # parallelise the axis that actually has many items — the sub-windows of a wide
+        # (backfill / catch-up) read. A steady 1-minute cycle still yields one window, so
+        # this changes nothing there.
+        work = [(wi, wc) for wi in range(len(windows)) for wc in webid_batches]
+
+        if self._concurrency <= 1 or len(work) <= 1:
+            for wi, wc in work:
+                ws, we = windows[wi]
+                yield from self._read_window(s, wc, ws, we, wi == 0)
+            return
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _one(item):
+            wi, wc = item
+            ws, we = windows[wi]
+            # Materialise inside the worker: the caller yields lazily, and a generator
+            # returned from a pool would run on the consuming thread instead.
+            return list(self._read_window(s, wc, ws, we, wi == 0))
+
+        with ThreadPoolExecutor(max_workers=self._concurrency) as pool:
+            # Bounded waves: pool.map would submit every item at once and hold all
+            # response bodies in memory (a 6-month backfill is thousands of windows).
+            # Keep at most `concurrency` results in flight.
+            for i in range(0, len(work), self._concurrency):
+                for rows in pool.map(_one, work[i:i + self._concurrency]):
+                    yield from rows
 
 
 class PITimeSeriesBatchReader(_PITimeSeriesMixin, DataSourceReader):
@@ -322,7 +419,8 @@ class PITimeSeriesStreamReader(_PITimeSeriesMixin, DataSourceStreamReader):
         if self._read_mode == "value":
             def _gen():
                 s = session(self._bearer, self._api_key,
-                            basic_user=self._basic_user, basic_password=self._basic_password)
+                            basic_user=self._basic_user, basic_password=self._basic_password,
+                            verify_tls=self._verify_tls)
                 for wc in (chunk(list(partition.web_ids), self._webids_per_call)
                            if self._bulk_read else [[w] for w in partition.web_ids]):
                     url, params = self._streamset_url_params(wc, partition.start_ts, partition.end_ts)

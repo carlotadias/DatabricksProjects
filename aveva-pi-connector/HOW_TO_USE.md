@@ -27,6 +27,32 @@ see [README.md](README.md).
   > it — run `auth/basic_auth_probe.py` (see [auth/AUTH_RUNBOOK.md](auth/AUTH_RUNBOOK.md)).
   > An on-box `curl` success does not prove the remote path works.
 
+#### Network: the cluster must resolve the PI FQDN (DNS)
+
+The connector uses plain `requests` — it looks up the hostname in `endpoint_url`
+via normal DNS. Two things must be true from the cluster:
+
+1. **Route open** — the cluster can reach PI's IP on 443. Quick check:
+   ```python
+   import socket; socket.create_connection(("<PI_IP>", 443), timeout=5)  # no error = route OK
+   ```
+2. **FQDN resolves** — DNS turns the FQDN into that IP:
+   ```python
+   import socket; socket.gethostbyname("<PI_FQDN>")   # no error = DNS OK
+   ```
+
+If **(1) works but (2) fails** (route open, DNS can't resolve — a common VNet gap),
+pin the name locally with the **`scripts/pi_dns_init.sh` cluster init script**: edit
+`PI_FQDN` / `PI_IP`, attach it under *Cluster → Advanced → Init Scripts*, restart.
+It adds `PI_IP  PI_FQDN` to `/etc/hosts` on every node, so the FQDN resolves — and
+because you still dial the **name**, the TLS cert validates (keep `verify_tls=true`).
+
+> **Do NOT put the raw IP in `endpoint_url`.** The connector can't dial an IP while
+> presenting the FQDN (the way the standalone auth-probe notebook does), so an IP
+> URL breaks TLS hostname validation. Always use the FQDN + fix resolution via the
+> init script. The init script is a **stopgap** — the durable fix is pointing the
+> cluster's VNet at the internal DNS zone.
+
 ### Step 1: build & publish the two wheels to a UC Volume
 There are **two packages** — a Spark connector and a lookup library — each with its
 own `pyproject.toml`. One command builds **and** publishes both:
@@ -46,14 +72,37 @@ copies them to `/Volumes/<CATALOG>/<LIBS_SCHEMA>/<LIBS_VOLUME>/`. The wheels **m
 land on the Volume before Step 2 — that's where `%pip` reads them from.
 
 > Just need the files by hand? `(cd timeseries && python -m build --wheel --outdir dist)`
-> and the same in `assetframework/` produce `aveva_pi_timeseries-2.0.3` /
-> `aveva_pi_assetframework-3.0.1` in each `dist/`; then copy them to the Volume yourself.
+> and the same in `assetframework/` produce `aveva_pi_timeseries-2.0.4` /
+> `aveva_pi_assetframework-3.0.2` in each `dist/`; then copy them to the Volume yourself.
+
+#### Shortcut: skip Steps 1–2 entirely — install straight from the repo
+
+Just trying it out? You don't need the CLI, `deploy.sh`, or a UC Volume at all. Clone
+this repo into Databricks (**Git folder / Repos**) and point `%pip` at the package
+**directories** — pip builds and installs them in place:
+
+```python
+%pip install /Workspace/Users/<you>/DatabricksProjects/aveva-pi-connector/timeseries \
+             /Workspace/Users/<you>/DatabricksProjects/aveva-pi-connector/assetframework
+dbutils.library.restartPython()
+```
+
+(Path varies: newer workspaces use `/Workspace/Users/<email>/…`, older ones
+`/Workspace/Repos/<user>/…` — check the sidebar. `test_assetframework.py` needs only
+the `assetframework` directory.)
+
+**Why this is nice:** no version pinning, so no stale-wheel mismatch — `git pull` and
+re-run always gets the current code. Each test notebook has this as a commented
+"Option B" in its first cell.
+
+**When to still use Steps 1–2:** production jobs and multiple clusters, where
+versioned wheels on a Volume are shareable and don't depend on a repo checkout.
 
 ### Step 2: install on the cluster
 Install both (or just the one you need) **from the Volume you published to in Step 1**:
 ```python
-%pip install /Volumes/<catalog>/<schema>/<volume>/aveva_pi_assetframework-3.0.1-py3-none-any.whl \
-             /Volumes/<catalog>/<schema>/<volume>/aveva_pi_timeseries-2.0.3-py3-none-any.whl
+%pip install /Volumes/<catalog>/<schema>/<volume>/aveva_pi_assetframework-3.0.2-py3-none-any.whl \
+             /Volumes/<catalog>/<schema>/<volume>/aveva_pi_timeseries-2.0.4-py3-none-any.whl
 dbutils.library.restartPython()
 ```
 
@@ -141,6 +190,37 @@ the UI/logs, so treat credentials as secrets.
 > The connector code also accepts a `bearer_token` option, but it exists only to
 > pass the demo's OAuth-gated mock App (a Databricks-platform gate, not PI auth).
 > Against a real PI server, use Basic.
+
+#### `verify_tls`  *(default `true`)*
+Whether to validate PI's TLS certificate. Leave it `true`. Set `"false"` **only as a
+short-term diagnostic** when PI uses an **internal / self-signed CA** that isn't yet
+in the cluster's trust store, so a verified request fails with a cert error:
+```python
+.option("verify_tls", "false")
+```
+This disables the certificate **and** hostname checks — the connection (and the
+reusable Basic password it carries) is then exposed to MITM. The proper fix is to
+**import the PI/enterprise CA into the cluster trust store** and keep
+`verify_tls=true`. Note `verify_tls=false` fixes only *certificate* errors — it does
+**not** help if DNS can't resolve the PI FQDN from the cluster.
+
+**To install the CA:**
+1. Get the CA chain as **PEM** (base64 text) from the PI/PKI team — the **issuing CA and
+   its root**, not PI's server certificate. Inspect what you were given with openssl
+   (`crl2pkcs7` piped to `pkcs7 -print_certs`): you want two CAs, and a root is
+   self-signed so its subject matches its issuer.
+2. Put the PEM on a UC Volume.
+3. Edit `CA_PEM` in [`scripts/pi_ca_init.sh`](scripts/pi_ca_init.sh), attach it under
+   *Compute -> Advanced -> Init scripts*, and **restart the cluster**.
+4. Run [`notebooks/verify_tls_trust.py`](notebooks/verify_tls_trust.py) — it checks the
+   handshake on the **driver and every executor** (the connector reads from executors, so
+   a driver-only pass is not conclusive). No credentials needed.
+5. Once it reports TRUSTED everywhere, set `verify_tls=true`.
+
+> The init script appends the CA to **certifi's** bundle, because that is what `requests`
+> reads — appending only to the OS trust store is not enough. Verified on DBR 16.4 that
+> this survives a later `%pip install` + `restartPython()`, so no environment variables
+> are needed (which also avoids env-var restrictions in shared access mode).
 
 ### `aveva_pi_timeseries` options
 

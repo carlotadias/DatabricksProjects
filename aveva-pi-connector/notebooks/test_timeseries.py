@@ -19,12 +19,30 @@
 # MAGIC | 4 | `recordedattime` | value as-of (batch only) |
 # MAGIC | 5 | streaming (interpolated) → Delta | continuous ingest, checkpoint |
 # MAGIC | 6 | streaming (value) | late-tag suppression / change feed |
+# MAGIC
+# MAGIC > **Updated for timeseries 2.1.0.** Two changes if you ran this against ≤ 2.0.4:
+# MAGIC > `max_advance_seconds` was **removed** (dead since 2.0.0 — it implied micro-batch
+# MAGIC > pacing that never happened), so tests 5-6 no longer pass it; and test 3 now uses a
+# MAGIC > **one-hour** `recorded` window instead of `WINDOW_START`..now. The wide version was
+# MAGIC > thousands of sub-windows per task, which 2.1.0 reads 8-at-a-time now that
+# MAGIC > `partition_concurrency` actually works — a lot of concurrent load on a real PI just
+# MAGIC > to prove a read succeeds.
+# MAGIC >
+# MAGIC > 2.1.0 also **raises** on `maxCount` truncation instead of silently dropping values.
+# MAGIC > If test 3 fails with "PI truncated ...", that is the fix working: the archive is
+# MAGIC > denser than the window assumed. Lower `webids_per_call` or set
+# MAGIC > `assumed_values_per_second`. See `KNOWN_ISSUES.md` #1.
 
 # COMMAND ----------
 
-# MAGIC %pip install /Volumes/<catalog>/<schema>/<volume>/aveva_pi_timeseries-2.0.3-py3-none-any.whl /Volumes/<catalog>/<schema>/<volume>/aveva_pi_assetframework-3.0.1-py3-none-any.whl
-# MAGIC # ^ EDIT the Volume path to where you published the wheels (see HOW_TO_USE.md Step 1)
-# MAGIC # ^ connector wheel is what we test; library wheel is only used to resolve test WebIDs below
+# MAGIC %pip install /Volumes/<catalog>/<schema>/<volume>/aveva_pi_timeseries-2.1.0-py3-none-any.whl /Volumes/<catalog>/<schema>/<volume>/aveva_pi_assetframework-3.0.2-py3-none-any.whl
+# MAGIC # ^ OPTION A (wheels on a UC Volume) — EDIT the path (see HOW_TO_USE.md Step 1).
+# MAGIC #   The connector is what we test; the library is only used to resolve test WebIDs below.
+# MAGIC #
+# MAGIC # OPTION B (no build/publish needed) — install straight from the cloned repo.
+# MAGIC # Comment out the line above, uncomment this, and fix the path to your Git folder
+# MAGIC # (check the sidebar; it's usually /Workspace/Users/<you>/... or /Workspace/Repos/<you>/...):
+# MAGIC # %pip install /Workspace/Users/<you>/DatabricksProjects/aveva-pi-connector/timeseries /Workspace/Users/<you>/DatabricksProjects/aveva-pi-connector/assetframework
 dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -37,6 +55,15 @@ SCOPE        = "pi"                           # EDIT
 BASIC_USER_KEY = "pi_user"       # EDIT
 BASIC_PW_KEY   = "pi_password"   # EDIT
 
+# --- Connectivity (see the preflight cell below) --------------------------------
+# FALLBACK_IP: if the cluster can't resolve the PI FQDN via DNS, set PI's IP here
+#   and the preflight cell pins FQDN->IP in /etc/hosts. SINGLE-NODE CLUSTERS ONLY
+#   (driver == executor). On a multi-node cluster use scripts/pi_dns_init.sh instead.
+FALLBACK_IP = ""                 # EDIT e.g. "10.0.0.5"  (leave "" if DNS works)
+# VERIFY_TLS: keep True. Set False as a diagnostic if PI uses an internal/self-signed
+#   CA not yet in the cluster trust store (verified request fails with a cert error).
+VERIFY_TLS  = "true"             # "true" | "false"
+
 # Provide WebIDs directly, OR tag names (resolved via the library in setup).
 WEB_IDS = [
     # "F1AbE... ", "F1AbE...",
@@ -45,6 +72,11 @@ TAGS = [
     # "Plant.Area.Unit1.Temp", "Plant.Area.Unit1.Pressure",   # resolved if WEB_IDS empty
 ]
 WINDOW_START = "2026-01-01T00:00:00Z"
+# A NARROW window for `recorded` (test 3). WINDOW_START..now is months of raw archive:
+# thousands of sub-windows per task, and on a dense archive 2.1.0 will now raise on
+# truncation rather than silently dropping values. One hour is enough to prove the read.
+from datetime import datetime, timedelta, timezone  # noqa: E402
+RECORDED_START = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
 INTERVAL     = "1m"
 AS_OF        = "2026-01-01T00:30:00Z"
 STREAM_TABLE = "<catalog>.<schema>.pi_ts_test"          # EDIT
@@ -72,6 +104,86 @@ _results = []
 def check(name, ok, detail=""):
     _results.append((name, bool(ok), detail))
     print(f"{'✅ PASS' if ok else '❌ FAIL'}  {name}" + (f"  — {detail}" if detail else ""))
+
+# COMMAND ----------
+
+# MAGIC %md ### Connectivity preflight (route + DNS; optional /etc/hosts pin)
+# MAGIC Confirms the cluster can reach PI, and — if DNS can't resolve the FQDN — pins
+# MAGIC `FALLBACK_IP -> FQDN` in `/etc/hosts` so the connector's FQDN call resolves.
+# MAGIC **⚠️ SINGLE-NODE CLUSTERS ONLY:** this writes the driver's hosts file; on a
+# MAGIC multi-node cluster the executors (which do the reads) won't get it — use the
+# MAGIC `scripts/pi_dns_init.sh` init script there instead. Pinning keeps you dialing
+# MAGIC the FQDN, so the TLS cert still matches (unlike putting the raw IP in the URL).
+
+# COMMAND ----------
+
+if not USE_MOCK:
+    import socket, time
+    from urllib.parse import urlparse
+    _host = urlparse(ENDPOINT_URL).hostname
+    _port = urlparse(ENDPOINT_URL).port or 443
+
+    # DNS with retries — absorbs the transient EAI_AGAIN ("temporary failure in name
+    # resolution") this environment has shown; only declares failure after 3 misses.
+    def _resolve(host, tries=3):
+        for _i in range(tries):
+            try:
+                return socket.gethostbyname(host)
+            except socket.gaierror:
+                if _i < tries - 1:
+                    time.sleep(1.5)
+        raise
+
+    # 1. Route check — connect to PI's IP:port (uses FALLBACK_IP if given, else DNS).
+    _ip = FALLBACK_IP or None
+    try:
+        if not _ip:
+            _ip = _resolve(_host)   # will raise if DNS can't resolve after retries
+        socket.create_connection((_ip, _port), timeout=5).close()
+        print(f"✅ route OK — reached {_ip}:{_port}")
+    except Exception as _e:
+        print(f"❌ cannot reach PI ({_e!r}). If this is a timeout, the network path is "
+              f"blocked (not just DNS) — escalate to network team; the hosts pin won't help.")
+
+    # 2. If DNS can't resolve the FQDN but we have a FALLBACK_IP, pin it in /etc/hosts.
+    try:
+        _resolve(_host)
+        print(f"✅ DNS resolves {_host}")
+    except Exception:
+        if FALLBACK_IP:
+            line = f"{FALLBACK_IP}  {_host}\n"
+            with open("/etc/hosts") as _f:
+                _present = _host in _f.read()
+            if not _present:
+                with open("/etc/hosts", "a") as _f:
+                    _f.write(line)
+            print(f"📌 pinned {_host} -> {FALLBACK_IP} in /etc/hosts (single-node only). "
+                  f"Re-resolves to: {_resolve(_host)}")
+        else:
+            print(f"❌ DNS can't resolve {_host} and FALLBACK_IP is empty. Set FALLBACK_IP "
+                  f"to PI's IP (single-node), or attach scripts/pi_dns_init.sh (multi-node).")
+
+    # 3. TLS trust probe — try a verified HTTPS handshake to the FQDN. If (and ONLY
+    #    if) it fails because the cert isn't trusted (internal/self-signed CA), flip
+    #    VERIFY_TLS to "false" for this run so the reads proceed. A timeout/DNS error
+    #    is NOT a TLS problem and does not flip the flag.
+    if VERIFY_TLS == "true":
+        import ssl
+        try:
+            _ctx = ssl.create_default_context()
+            with socket.create_connection((_host, _port), timeout=5) as _raw:
+                with _ctx.wrap_socket(_raw, server_hostname=_host):
+                    pass
+            print(f"✅ TLS cert trusted for {_host} — keeping verify_tls=true")
+        except ssl.SSLCertVerificationError as _e:
+            VERIFY_TLS = "false"
+            print(f"⚠️  TLS cert NOT trusted ({_e.verify_message or _e}). Likely an internal CA. "
+                  f"→ set verify_tls=FALSE for this diagnostic run. "
+                  f"Production fix: import the PI/enterprise CA into the cluster trust store.")
+        except Exception as _e:
+            print(f"ℹ️  TLS probe inconclusive ({_e!r}) — not a cert-trust error, leaving verify_tls=true.")
+
+print(f"verify_tls for this run: {VERIFY_TLS}")
 
 # COMMAND ----------
 
@@ -119,11 +231,14 @@ if not WEB_IDS and TAGS and not USE_MOCK:
     reqs = {str(i): {"Method": "GET",
                      "Resource": f"{BASE}/points?path=" + quote(rf"\\{PI_SERVER}\{t}", safe="")}
             for i, t in enumerate(TAGS)}
-    resp = batch(BASE, reqs, **AUTH)
+    # verify_tls too — the library defaults to True, so pass the preflight's decision
+    # (VERIFY_TLS is a string here; the library wants a bool)
+    resp = batch(BASE, reqs, **AUTH, verify_tls=(VERIFY_TLS != "false"))
     WEB_IDS = [resp[str(i)]["Content"]["WebId"] for i in range(len(TAGS))]
 print(f"{len(WEB_IDS)} WebIDs to read")
 
-TS_OPTS = {"endpoint_url": ENDPOINT_URL, "web_ids": ",".join(WEB_IDS), **AUTH}
+TS_OPTS = {"endpoint_url": ENDPOINT_URL, "web_ids": ",".join(WEB_IDS),
+           "verify_tls": VERIFY_TLS, **AUTH}
 
 # COMMAND ----------
 
@@ -163,9 +278,13 @@ except Exception as e:
 # COMMAND ----------
 
 try:
+    # RECORDED_START, not WINDOW_START: the latter runs to now(), and a months-wide
+    # window is thousands of sub-windows per task. 2.1.0 reads those 8 at a time
+    # (partition_concurrency was inert before), so keep the span deliberately small here —
+    # this test checks the read WORKS, not how fast a backfill is.
     df = spark.read.format("aveva_pi_timeseries").options(
-        **TS_OPTS, read_mode="recorded", initial_watermark=WINDOW_START,
-        lookback_seconds="600", max_count="5000").load()
+        **TS_OPTS, read_mode="recorded", initial_watermark=RECORDED_START,
+        max_count="5000").load()
     n = df.count()
     check("3. recorded", n > 0, f"{n} rows")
 except Exception as e:
@@ -199,7 +318,7 @@ if not USE_MOCK:
 try:
     q = (spark.readStream.format("aveva_pi_timeseries").options(
             **TS_OPTS, read_mode="interpolated", interval=INTERVAL,
-            initial_watermark=WINDOW_START, max_advance_seconds="300").load()
+            initial_watermark=WINDOW_START).load()
          .writeStream.option("checkpointLocation", CHECKPOINT)
          .trigger(availableNow=True).toTable(STREAM_TABLE))
     q.awaitTermination()
@@ -218,7 +337,7 @@ except Exception as e:
 try:
     q = (spark.readStream.format("aveva_pi_timeseries").options(
             **TS_OPTS, read_mode="value",
-            initial_watermark=WINDOW_START, max_advance_seconds="300").load()
+            initial_watermark=WINDOW_START).load()
          .writeStream.option("checkpointLocation", CHECKPOINT + "_value")
          .trigger(availableNow=True).toTable(STREAM_TABLE + "_value"))
     q.awaitTermination()

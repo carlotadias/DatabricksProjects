@@ -21,13 +21,24 @@ PI_MAX_RETURNED_ITEMS = 150_000
 PI_DEFAULT_MAX_COUNT = 10_000
 PI_DEFAULT_PARTITION_CONCURRENCY = 8
 PI_DEFAULT_WEBIDS_PER_CALL = 50
+# How many times a window may be halved when PI truncates at maxCount. Each split doubles
+# the call count, so this bounds the blow-up: 12 splits = up to 4,096 sub-windows, enough
+# to take a 3,000 s window down to under a second.
+PI_MAX_WINDOW_SPLITS = 12
+# `recorded` has no interval to size a window from, so the span is derived from an assumed
+# archive rate. 1 value/sec/tag is a deliberately CONSERVATIVE default: too-wide windows
+# are recovered by truncation detection (a re-read), whereas too-narrow ones only cost
+# extra calls. Override with the `assumed_values_per_second` option when the real rate is
+# known — § 1 of notebooks/benchmark_fanout.py measures it.
+PI_ASSUMED_VALUES_PER_SECOND = 1.0
 # Retriable signals. 429 = documented per-IP rate limit (default 1,000 req/s;
 # the search controller has a *tighter* 50/s limit). 5xx = transient.
 PI_RETRY_STATUS = (429, 500, 502, 503, 504)
 
 
 def session(bearer_token: str | None, api_key: str | None, pool_maxsize: int = 32,
-            *, basic_user: str | None = None, basic_password: str | None = None):
+            *, basic_user: str | None = None, basic_password: str | None = None,
+            verify_tls: bool = True):
     """A pooled keep-alive session. Connection reuse matters: the docs warn
     against 'creating new HTTP connections per request'.
 
@@ -36,6 +47,12 @@ def session(bearer_token: str | None, api_key: str | None, pool_maxsize: int = 3
     server advertises only Negotiate in its WWW-Authenticate challenge — see
     RFC 9110 §11.6.2: Authorization is used "usually, but not necessarily, after
     receiving a 401"); `api_key` -> `X-API-Key`.
+
+    `verify_tls` — validate the server certificate (default True). Set False ONLY as
+    a diagnostic against an internal-CA / self-signed PI when the CA isn't yet in the
+    cluster trust store: it disables cert validation for this session and skips the
+    hostname check. This exposes the connection (and the reusable Basic credential
+    it carries) to MITM — prefer importing the CA and keeping verification on.
 
     Security: pass credentials from a secret store — never a literal. Basic sends a
     reusable AD credential on every request, so use TLS (verified) and a dedicated
@@ -54,6 +71,14 @@ def session(bearer_token: str | None, api_key: str | None, pool_maxsize: int = 3
     if api_key:
         s.headers["X-API-Key"] = api_key
     s.headers["Accept"] = "application/json"
+    s.verify = verify_tls
+    if not verify_tls:
+        # silence the per-request InsecureRequestWarning spam when validation is off
+        try:
+            from urllib3.exceptions import InsecureRequestWarning
+            requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+        except Exception:
+            pass
     adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
