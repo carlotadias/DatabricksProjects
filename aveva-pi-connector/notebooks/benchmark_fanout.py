@@ -338,7 +338,9 @@ MODE      = "recorded"       # THE READ MODE USED HERE. "recorded" = every archi
                              #   snapshot per tag (fixed rows, drops everything between polls)
 TAG_COUNTS = [10, 50, 190]   # how many tags to read — SMALL FIRST, then scale up
 TRIGGERS   = [30, 15, 5]     # seconds, LONG -> SHORT
-CHUNKS     = [100]           # webids_per_call (add 25 to compare; multiplies the runtime)
+CHUNKS     = [100]           # webids_per_call. ONE value = nothing to compare, so the
+                             #   summary cannot say which chunk is best. Add 25 for that;
+                             #   each extra value multiplies the wall-clock time.
 CYCLES     = 2               # micro-batches observed per combination
 CONCURRENCY = 8              # partition_concurrency (only bites if a window splits)
 # ------------------------------------------------------------------------------------
@@ -415,12 +417,21 @@ for _n in TAG_COUNTS:                       # small -> large
                 _dur = max(x["duration_s"] for x in _steady)
                 _rows = max(x["rows"] for x in _steady)
                 _pct = round(100 * _dur / _t, 1)
+                # Derived, no extra calls: a cycle time alone cannot tell you whether PI
+                # or Spark is the cost. s_per_call and ms_per_tag make wide-vs-narrow
+                # calls comparable; waves > 1 means tasks queued for a slot.
+                _calls = -(-_n // _chunk)
                 BREAK.append({"tags": _n, "webids_per_call": _chunk, "trigger_s": _t,
                               "worst_cycle_s": _dur, "pct_of_trigger": _pct, "rows": _rows,
                               "fits": _pct < 100, "read_mode": MODE,
-                              "calls_per_cycle": -(-_n // _chunk),
+                              "calls_per_cycle": _calls,
+                              "s_per_call": round(_dur / _calls, 3),
+                              "ms_per_tag": round(1000 * _dur / _n, 1),
+                              "rows_per_sec": round(_rows / _dur) if _dur else None,
+                              "waves": -(-_calls // max(1, CLUSTER_CORES)),
                               "cluster_parallelism": CLUSTER_CORES})
                 print(f"{_lbl}  worst {_dur:>6.2f}s  {_pct:>6.1f}%  {_rows:>8,} rows  "
+                      f"{_calls:>2} calls @ {_dur/_calls:>5.2f}s  {1000*_dur/_n:>5.1f} ms/tag  "
                       f"{'✅' if _pct < 50 else '⚠️ tight' if _pct < 100 else '🚨 OVERRUNS'}")
                 if _pct >= 100:
                     print("        ⛔ stopping this tag count — shorter triggers only fail harder")
@@ -499,7 +510,8 @@ if BREAK:
 # multi-hour sweep. Two points is enough to confirm the cost is LINEAR, which is what
 # makes extrapolation to 30/180/365 days legitimate.
 HIST_HOURS  = [1, 6]      # hours of history per run
-HIST_CHUNKS = [100]       # webids_per_call (add 25 to compare, doubles the runtime)
+HIST_CHUNKS = [100, 25]   # webids_per_call — two values so the winner is a CHOICE,
+                          #   not the only thing tested. Each adds one run per hour/conc.
 HIST_CONC   = [8, 1]      # partition_concurrency — 1 reproduces pre-2.1.0 behaviour
 
 _est = int(len(WEB_IDS) * RATE * 3600)
@@ -538,17 +550,27 @@ for _hours in HIST_HOURS:
                       .load().count())
                 # ------------------------------------------------------------------
                 _secs = time.perf_counter() - _t0
+                # Derived: total calls = windows x tasks, so s_per_call is comparable
+                # across window widths. min_per_day is the figure to quote.
+                _tasks = -(-len(WEB_IDS) // _chunk)
+                _calls_total = _windows * _tasks
                 HIST.append({"hours": _hours, "webids_per_call": _chunk,
                              "partition_concurrency": _conc, "seconds": round(_secs, 1),
                              "rows": _n, "rows_per_sec": round(_n / _secs) if _secs else None,
                              "sub_windows_per_task": _windows,
+                             "calls_total": _calls_total,
+                             "s_per_call": round(_secs / _calls_total, 3),
+                             "min_per_day": round(_secs / _hours * 24 / 60, 1),
                              "cluster_parallelism": CLUSTER_CORES, "error": ""})
                 print(f"  {_hours}h chunk={_chunk:<4} conc={_conc:<2} {_secs:>7.1f}s  "
-                      f"{_n:>9} rows  {round(_n/_secs):>8} rows/s  (~{_windows} windows/task)")
+                      f"{_n:>9,} rows  {round(_n/_secs):>8,} rows/s  "
+                      f"{_calls_total:>3} calls @ {_secs/_calls_total:>5.2f}s  "
+                      f"= {_secs/_hours*24/60:>5.1f} min/day")
             except Exception as e:
                 HIST.append({"hours": _hours, "webids_per_call": _chunk,
                              "partition_concurrency": _conc, "seconds": None, "rows": None,
                              "rows_per_sec": None, "sub_windows_per_task": _windows,
+                             "calls_total": None, "s_per_call": None, "min_per_day": None,
                              "cluster_parallelism": CLUSTER_CORES, "error": str(e)[:200]})
                 print(f"  {_hours}h chunk={_chunk:<4} conc={_conc:<2} FAILED: {str(e)[:110]}")
 
@@ -560,6 +582,7 @@ if HIST:
     display(spark.createDataFrame(
         [(int(h["hours"]), int(h["webids_per_call"]), int(h["partition_concurrency"]),
           h["seconds"], h["rows"], h["rows_per_sec"], h["sub_windows_per_task"],
+          h["calls_total"], h["s_per_call"], h["min_per_day"],
           int(h["cluster_parallelism"]), h["error"]) for h in HIST],
         schema=StructType([
             StructField("hours", IntegerType()),
@@ -569,6 +592,9 @@ if HIST:
             StructField("rows", LongType()),
             StructField("rows_per_sec", LongType()),
             StructField("sub_windows_per_task", IntegerType()),
+            StructField("calls_total", IntegerType()),
+            StructField("s_per_call", DoubleType()),
+            StructField("min_per_day", DoubleType()),
             StructField("cluster_parallelism", IntegerType()),
             StructField("error", StringType()),
         ])))
@@ -672,3 +698,97 @@ if RESULT_TABLE and results:
     spark.createDataFrame(results).write.mode("append").option("mergeSchema", "true") \
          .saveAsTable(RESULT_TABLE)
     print(f"\nSaved → {RESULT_TABLE}")
+
+# COMMAND ----------
+
+# MAGIC %md ### Summary table — the findings in one place
+
+# COMMAND ----------
+
+# One row per finding, so the whole run can be pasted into customer notes or saved to a
+# table. Values come from §§ 1-2; anything not run shows as "not run" rather than blank.
+_S = []
+
+
+def _row(metric, value, detail=""):
+    _S.append({"metric": metric, "value": str(value), "detail": detail})
+
+
+_row("connector", f"aveva_pi_timeseries {_ts.__version__}", BASE)
+_row("tags read", len(WEB_IDS), f"read_mode={MODE}")
+_row("archive density", f"{RATE} values/sec/tag" if RATE else "not run",
+     f"one value every {round(1/RATE,1)}s" if RATE else "")
+_row("cluster slots", CLUSTER_CORES, _cores_src)
+
+# --- § 1 freshness ---------------------------------------------------------------
+if BREAK:
+    _safe = [b for b in BREAK if b["pct_of_trigger"] < 50]
+    _fits = [b for b in BREAK if b["fits"]]
+    # Report the floor at the LARGEST tag count tested — a 5s trigger for 10 tags is not
+    # the answer anyone wants. Prefer more tags first, then the shortest trigger.
+    _pool = _safe or _fits
+    _best = max(_pool, key=lambda b: (b["tags"], -b["trigger_s"])) if _pool else None
+    if _best:
+        _row("freshness floor", f"{_best['trigger_s']}s trigger",
+             f"{_best['tags']} tags, chunk={_best['webids_per_call']}, "
+             f"{_best['pct_of_trigger']}% of the interval used"
+             + ("" if _safe else "  ⚠️ >50% used, no room for a slow cycle"))
+        _row("cycle cost", f"{_best['worst_cycle_s']}s worst cycle",
+             f"{_best['calls_per_cycle']} calls @ {_best['s_per_call']}s, "
+             f"{_best['ms_per_tag']} ms/tag, {_best['rows']:,} rows")
+    _over = [b for b in BREAK if not b["fits"]]
+    _row("overruns at", f"{min(b['trigger_s'] for b in _over)}s" if _over else "none in sweep",
+         f"tested {sorted({b['trigger_s'] for b in BREAK})}s x "
+         f"{sorted({b['tags'] for b in BREAK})} tags")
+    # Does chunk size matter? Compare ms/tag at the widest and narrowest tested.
+    _by_chunk = {}
+    for b in BREAK:
+        _by_chunk.setdefault(b["webids_per_call"], []).append(b["ms_per_tag"])
+    if len(_by_chunk) > 1:
+        # Best = lowest ms/tag, whichever chunk that turns out to be — not assumed.
+        _best_chunk = min(_by_chunk, key=lambda c: min(_by_chunk[c]))
+        _worst_chunk = max(_by_chunk, key=lambda c: min(_by_chunk[c]))
+        _row("best chunk size", f"webids_per_call={_best_chunk}",
+             f"{min(_by_chunk[_best_chunk])} ms/tag vs "
+             f"{min(_by_chunk[_worst_chunk])} at chunk={_worst_chunk} "
+             f"({min(_by_chunk[_worst_chunk])/min(_by_chunk[_best_chunk]):.2f}x)")
+    else:
+        _row("best chunk size", f"only {list(_by_chunk)[0]} tested",
+             "add a second value to § 1 CHUNKS to compare")
+else:
+    _row("freshness floor", "not run", "§ 1")
+
+# --- § 2 history -----------------------------------------------------------------
+if _ok:
+    _b2 = min(_ok, key=lambda h: h["seconds"] / h["hours"])
+    _pd = _b2["seconds"] / _b2["hours"] * 24
+    _tried = sorted({h["webids_per_call"] for h in _ok})
+    _row("backfill rate", f"{_pd/60:.1f} min per day",
+         f"fastest of chunk {_tried}: chunk={_b2['webids_per_call']}, "
+         f"conc={_b2['partition_concurrency']}, {_b2['rows_per_sec']:,} rows/s"
+         + ("" if len(_tried) > 1 else "  (only one chunk tested)"))
+    _row("backfill 30d", f"{_pd*30/3600:.1f} h", "extrapolated — check § 2b is linear")
+    _row("backfill 180d", f"{_pd*180/3600:.1f} h", "extrapolated — check § 2b is linear")
+    # Did partition_concurrency help? Only meaningful with >1 sub-window per task.
+    _pairs = {}
+    for h in _ok:
+        _pairs.setdefault((h["hours"], h["webids_per_call"]), {})[h["partition_concurrency"]] = h
+    _sp = [(p[1]["seconds"] / p[8]["seconds"], p[8]) for p in _pairs.values()
+           if 1 in p and 8 in p and p[8]["seconds"]]
+    if _sp:
+        _sx, _hh = max(_sp, key=lambda x: x[0])
+        _row("partition_concurrency", f"{_sx:.2f}x (conc 8 vs 1)",
+             f"{_hh['sub_windows_per_task']} sub-windows/task"
+             + ("" if _hh["sub_windows_per_task"] > 1 else
+                " — 1 window means there is nothing to fan out"))
+else:
+    _row("backfill rate", "not run", "§ 2")
+
+display(spark.createDataFrame(_S, schema="metric string, value string, detail string"))
+
+if RESULT_TABLE and _S:
+    spark.createDataFrame([{**r, "run_utc": _now_iso()} for r in _S]) \
+         .write.mode("append").option("mergeSchema", "true") \
+         .saveAsTable(RESULT_TABLE + "_summary")
+    print(f"Saved → {RESULT_TABLE}_summary")
+
