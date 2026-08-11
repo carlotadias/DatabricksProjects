@@ -125,6 +125,24 @@ if tuple(int(x) for x in _ts.__version__.split(".")[:2]) < (2, 1):
 
 BASE = ENDPOINT_URL.rstrip("/")
 
+
+def _cause(e) -> str:
+    """The useful line from a Spark exception, not the first 110 chars of boilerplate.
+
+    A connector failure surfaces as "An exception was thrown from the Python worker" with
+    the real cause — HTTP status, a URL-too-long rejection, our own truncation RuntimeError —
+    buried further down. Pull the deepest informative line out.
+    """
+    _s = str(e)
+    _pat = ("HTTP", "SSL", "Timeout", "timed out", "ConnectionError", "RuntimeError",
+            "ValueError", "404", "413", "414", "429", "500", "502", "503",
+            "truncated", "maxCount", "Max retries")
+    _hits = [ln.strip() for ln in _s.splitlines()
+             if any(p in ln for p in _pat) and "Python worker" not in ln]
+    return (_hits[-1][:300] if _hits else _s.splitlines()[0][:300])
+
+
+
 # Auth. Two shapes: AUTH for the assetframework library (kwargs), CONN_AUTH for the
 # connector (Spark options). The mock App needs a Bearer token for the OAuth proxy;
 # real PI needs HTTP Basic.
@@ -178,10 +196,22 @@ print(f"cluster parallelism (≈ parallel tasks): {CLUSTER_CORES}   [{_cores_src
 # WebIDs. Given directly? Use them. Otherwise resolve TAGS through the API: one POST
 # /batch whose sub-requests are GET /points?path=\\<PI_SERVER>\<tag>. A wrong PI_SERVER
 # or a name that is not a full PI point path comes back 404 and is listed below.
+# Drop blanks first: a half-commented WEB_IDS list can leave [""] behind, which is
+# truthy enough to skip resolution and then fail the assert at the end with nothing
+# printed in between.
+WEB_IDS = [w for w in (WEB_IDS or []) if str(w).strip()]
+TAGS = [t for t in (TAGS or []) if str(t).strip()]
+print(f"input: {len(WEB_IDS)} WEB_IDS, {len(TAGS)} TAGS")
+if not WEB_IDS and not TAGS:
+    raise ValueError(
+        "Both WEB_IDS and TAGS are empty. Set one of them in the config cell above:\n"
+        "  WEB_IDS = [\"F1DP...\", ...]   -> used directly, no lookup\n"
+        "  TAGS    = [\"MyTag\", ...]     -> resolved via GET /points on PI_SERVER\n"
+        "If you did set them, the config cell has not been re-run since you edited it.")
+
 if WEB_IDS:
     print(f"using {len(WEB_IDS)} WebIDs given directly (no lookup needed)")
 else:
-    assert TAGS, "Set WEB_IDS or TAGS — there is nothing to read."
     # RESOLUTION ORDER: GET /points first, POST /batch only as an optimisation.
     #
     # Batch collapses N lookups into one request, which is why it used to be tried first —
@@ -246,7 +276,14 @@ else:
         print(f"   ⚠️ {len(_bad)} did NOT resolve: {_bad[:5]}")
         print("   Either those tags are not on this archive, or PI_SERVER is wrong. You can")
         print("   also paste WEB_IDS directly — that needs no lookup and no PI_SERVER.")
-assert WEB_IDS, "No WebIDs — check auth, PI_SERVER and the tag names."
+if not WEB_IDS:
+    raise AssertionError(
+        f"No WebIDs resolved from {len(TAGS)} tag name(s). The grouped reasons are printed\n"
+        f"above — read those first. Most common causes:\n"
+        f"  * PI_SERVER ('{PI_SERVER}') is not the Data Archive name, or the casing differs.\n"
+        f"    Check with: _sess.get(f'{{BASE}}/dataservers').json()['Items']\n"
+        f"  * the tags are not points on that archive\n"
+        f"  * lookup is refused for this account (then /points returns 403, not 404)")
 
 # THE CONNECTOR OPTIONS. Every read below is spark.read / spark.readStream with
 # .format("aveva_pi_timeseries") and these options; the per-test knobs
@@ -262,22 +299,6 @@ results = []
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
-def _cause(e) -> str:
-    """The useful line from a Spark exception, not the first 110 chars of boilerplate.
-
-    A connector failure surfaces as "An exception was thrown from the Python worker" with
-    the real cause — HTTP status, a URL-too-long rejection, our own truncation RuntimeError —
-    buried further down. Pull the deepest informative line out.
-    """
-    _s = str(e)
-    _pat = ("HTTP", "SSL", "Timeout", "timed out", "ConnectionError", "RuntimeError",
-            "ValueError", "404", "413", "414", "429", "500", "502", "503",
-            "truncated", "maxCount", "Max retries")
-    _hits = [ln.strip() for ln in _s.splitlines()
-             if any(p in ln for p in _pat) and "Python worker" not in ln]
-    return (_hits[-1][:300] if _hits else _s.splitlines()[0][:300])
 
 
 
