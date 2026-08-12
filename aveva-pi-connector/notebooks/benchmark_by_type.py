@@ -318,29 +318,37 @@ BREAK, HIST = [], []                  # § 1 and § 2 results
 _BENCH_TYPES = ["raw_point", "passthrough", "formula", "analysis"]
 
 
-def classify_web_id(prefix: str, data_reference) -> str:
-    """Pure mapping (WebID prefix, DataReference) -> bucket. Unit-testable, no I/O.
+def classify_web_id(prefix: str, data_reference, config_string=None) -> str:
+    """Pure mapping (WebID prefix, DataReference, ConfigString) -> bucket. No I/O; testable.
 
     Level 1 is the prefix (chars 3-4 of a WebID 2.0 string — confirmed against the PI Web
     API Reference: `DP`=PIPoint, `Ab`=AFAttribute, `Em`=AFElement, `DS`=PIServer). Level 2
-    refines an AF attribute by its `DataReference` string (the REST field name; the AF SDK
-    calls the same thing `DataReferencePlugIn`). `data_reference` is None for raw points
-    (never looked up) and for static attributes with no data reference.
+    refines an AF attribute by its data reference. `data_reference` is the plug-in name
+    (`"PI Point"` / `"Formula"` / …) read from whichever field this server exposes it in
+    (`DataReference` or `DataReferencePlugIn`).
+
+    ConfigString is the FALLBACK when the name is missing/blank (some PI builds omit it, or
+    localize it): a PI Point reference's ConfigString is a tag path starting `\\` (e.g.
+    `\\SERVER\TAG` or `\\SERVER?guid\path`); a Formula's is an expression with `=`/`[...]`.
     """
     p4 = (prefix or "")[:4]
     if p4 == "F1DP":
         return "raw_point"                       # a PI point — no data reference to read
     if p4 == "F1Ab":
         dr = (data_reference or "").strip()
-        if dr == "":
-            return "static"                      # AF attribute with no data reference
         if dr == "PI Point":
             return "passthrough"                 # AF attribute that maps straight to a point
         if dr == "Formula":
             return "formula"                     # computed on read
-        # Any other calc-backed reference (Analysis, Rollup, Table Lookup, custom, …).
-        # Names can be localized/customised, so this is the catch-all, not an allow-list.
-        return "analysis"
+        if dr:
+            return "analysis"                    # Analysis/Rollup/Table Lookup/custom — calc-backed
+        # No usable plug-in name — infer from ConfigString shape.
+        cs = (config_string or "").strip()
+        if cs.startswith("\\\\") or cs.startswith(r"\\"):
+            return "passthrough"                 # a tag path => PI Point Data Reference
+        if cs:
+            return "formula"                     # an expression => a calc-backed reference
+        return "static"                          # AF attribute with no data reference at all
     return "other"                               # element/data-server/unknown prefix
 
 
@@ -355,44 +363,64 @@ _sess.verify = VERIFY_TLS
 # first couple of F1Ab WebIDs. The classifier keys on `DataReference`; if THIS server
 # names it differently (older build, localized, customised), you will SEE it here and can
 # adjust the one field name below — rather than silently bucketing everything as `static`.
+# The data-reference plug-in name is exposed under DIFFERENT keys across PI builds
+# (`DataReference` in most, `DataReferencePlugIn` — the AF-SDK name — in some). Read
+# whichever is present.
+_DREF_KEYS = ("DataReference", "DataReferencePlugIn")
+
+
+def _dref_from(obj: dict):
+    for _k in _DREF_KEYS:
+        _v = obj.get(_k)
+        if _v:
+            return _v
+    return None
+
+
 _attr_wids = [w for w in WEB_IDS if w[:4] == "F1Ab"]
 if _attr_wids:
     print("── sanity: raw /attributes JSON for the first AF attribute(s) ──")
     for _w in _attr_wids[:2]:
         try:
+            # Fetch the FULL object (no selectedFields) so we can SEE which keys this
+            # server actually returns, rather than trusting one field name.
             _raw = _sess.get(f"{BASE}/attributes/{_w}", timeout=HTTP_TIMEOUT).json()
-            print(f"  {_w[:24]}…  DataReference={_raw.get('DataReference')!r}  "
-                  f"ConfigString={str(_raw.get('ConfigString'))[:60]!r}")
+            print(f"  {_w[:24]}…  keys={sorted(_raw.keys())}")
+            print(f"      data-ref={_dref_from(_raw)!r}  "
+                  f"ConfigString={str(_raw.get('ConfigString'))[:70]!r}")
         except Exception as _e:
             print(f"  {_w[:24]}…  lookup failed: {_cause(_e)}")
-    print("  ^ if DataReference is None but these ARE attributes, the field is named")
-    print("    differently on this server — change the .get('DataReference') below.\n")
+    print("  ^ classifier reads DataReference OR DataReferencePlugIn, and falls back to the")
+    print("    ConfigString shape (a \\\\SERVER\\TAG path => passthrough) when neither is set.\n")
 
 _buckets = {}                          # bucket -> [web_id, ...]
-_dref_of = {}                          # web_id -> DataReference (for the table)
+_dref_of = {}                          # web_id -> (data-ref name, ConfigString) for the table
 _unknown = []                          # web_ids whose Level-2 lookup errored
 _n_attr_calls = 0
 
 for _wid in WEB_IDS:
     _p4 = _wid[:4]
     if _p4 == "F1Ab":
-        # Level 2: only AF attributes need the extra call. `DataReference` is the REST
-        # field name (AF SDK calls it `DataReferencePlugIn`); ConfigString is fetched too
-        # as a cross-check (a \\SERVER\TAG path => point; a formula expression => formula).
+        # Level 2: only AF attributes need the extra call. Ask for BOTH possible name
+        # fields plus ConfigString (the fallback). `Items.` prefixes are not needed here
+        # (single object), but requesting extra fields a build lacks is harmless.
         try:
             _r = _sess.get(f"{BASE}/attributes/{_wid}",
-                           params={"selectedFields": "Name;DataReference;ConfigString"},
+                           params={"selectedFields":
+                                   "Name;DataReference;DataReferencePlugIn;ConfigString"},
                            timeout=HTTP_TIMEOUT)
             _n_attr_calls += 1
-            _dr = (_r.json() or {}).get("DataReference") if _r.status_code == 200 else None
+            _obj = _r.json() if _r.status_code == 200 else {}
+            _dr = _dref_from(_obj)
+            _cs = _obj.get("ConfigString")
         except Exception:
             _buckets.setdefault("unknown", []).append(_wid)
             _unknown.append(_wid)
             continue
     else:
-        _dr = None                     # points (and non-attributes) are Level-1 only
-    _dref_of[_wid] = _dr
-    _buckets.setdefault(classify_web_id(_p4, _dr), []).append(_wid)
+        _dr, _cs = None, None          # points (and non-attributes) are Level-1 only
+    _dref_of[_wid] = (_dr, _cs)
+    _buckets.setdefault(classify_web_id(_p4, _dr, _cs), []).append(_wid)
 
 # The dict the sweeps consume — only the benchmarkable buckets, non-empty ones.
 WEB_IDS_BY_TYPE = {t: _buckets[t] for t in _BENCH_TYPES if _buckets.get(t)}
