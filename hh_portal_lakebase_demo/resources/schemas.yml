@@ -1,0 +1,9 @@
+# UC schema for the SYNTHETIC data: dimensions, silver_hh_readings (Change Data Feed on) and portal_refresh_log.
+# The synced tables live in a second schema, <catalog>.portal, created by scripts/provision.py (its name is also
+# the Postgres schema name that sql/lakebase_gold.sql reads).
+resources:
+  schemas:
+    data:
+      catalog_name: ${var.catalog}
+      name: ${var.data_schema}
+      comment: "HH portal Lakebase demo: SYNTHETIC energy data. Not customer data."

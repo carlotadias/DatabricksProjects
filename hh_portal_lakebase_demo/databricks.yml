@@ -1,0 +1,83 @@
+# HH portal Lakebase demo: SYNTHETIC half-hourly energy data -> UC silver (Change Data Feed) -> Lakebase synced
+# tables -> gold views and materialized views inside Lakebase -> Lakebase Data API -> Databricks App.
+#
+# No environment values in this file: every workspace-specific value is a variable without a real default.
+# Supply them with --var name=value or, preferably, in the gitignored
+# .databricks/bundle/<target>/variable-overrides.json (see variable-overrides.example.json and README.md).
+bundle:
+  name: hh_portal_lakebase_demo
+
+include:
+  - resources/*.yml
+
+sync:
+  # app/static is the built UI (gitignored) and must be uploaded with the app.
+  include:
+    - app/static/**
+  exclude:
+    - tests/**
+    - docs/**
+    - frontend/**
+    - conftest.py
+    - variable-overrides.example.json
+
+variables:
+  catalog:
+    description: Existing Unity Catalog catalog for the demo schemas (you need USE CATALOG and CREATE SCHEMA). Required.
+  data_schema:
+    description: New UC schema (created by the bundle) for the synthetic dimensions, silver_hh_readings and the refresh log. Required.
+  app_name_prefix:
+    description: Prefix of the Databricks App name; the app is <prefix>-<target> (lowercase letters, digits, dashes). Required.
+  lakebase_project_id:
+    description: Lakebase project id (projects/<id>), created or reused by scripts/provision.py. Required.
+  lakebase_branch_id:
+    description: Lakebase branch holding the synced tables and gold (the default branch of a new project).
+    default: production
+  lakebase_endpoint_id:
+    description: Lakebase read-write compute endpoint of that branch.
+    default: primary
+  lakebase_data_api_url:
+    description: Lakebase Data API base URL (printed by `scripts/provision.py outputs`). Required; use a placeholder before provisioning.
+  lakebase_project_uid:
+    description: Project uid (printed by `scripts/provision.py outputs`); only for links on the Architecture page. Empty = no link.
+    default: ""
+  lakebase_branch_uid:
+    description: Branch uid (printed by `scripts/provision.py outputs`); only for links on the Architecture page. Empty = no link.
+    default: ""
+  lakebase_data_api_tab_path:
+    description: Path of the Data API tab under the Lakebase branch page, for the Architecture page link.
+    default: data-api
+  sync_pipeline_id:
+    description: Pipeline id of the silver synced table (printed by `scripts/provision.py outputs`); only for a link. Empty = no link.
+    default: ""
+  daily_cron:
+    description: Quartz cron of the daily refresh job.
+    default: "0 0 2 * * ?"
+  daily_timezone:
+    description: Time zone of the daily refresh job schedule.
+    default: UTC
+  daily_pause_status:
+    description: PAUSED or UNPAUSED for the daily refresh job schedule.
+    default: PAUSED
+  mpan_target:
+    description: Number of synthetic MPANs (meter points), in whole organisations of about 50 MPANs.
+    default: 1000
+  history_months:
+    description: Months of half-hourly history kept in silver (rolling window).
+    default: 13
+  max_rows:
+    description: Rows per Data API page the app requests (the Data API db_max_rows is 2000).
+    default: 2000
+  repo_url:
+    description: Optional https link to this project's source, shown on the Architecture page. Empty = no link.
+    default: ""
+
+targets:
+  # No `mode: development`: it would prefix the UC schema resource name, which the jobs and the app reference.
+  dev:
+    default: true
+    # workspace:
+    #   host: https://<WORKSPACE_HOST>
+  demo:
+    # workspace:
+    #   host: https://<WORKSPACE_HOST>

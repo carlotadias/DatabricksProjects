@@ -1,0 +1,49 @@
+# The portal app. Reads ONLY through the Lakebase Data API (HTTPS, OAuth token of the app service principal).
+# No `postgres` app resource on purpose: roles created by app resources cannot be granted to the Data API's
+# `authenticator` role. `scripts/provision.py grants` creates the app service principal's role with
+# databricks_create_role and grants SELECT on schema portal_gold only (docs/ADR.md 0003).
+resources:
+  apps:
+    hh_portal_app:
+      name: ${var.app_name_prefix}-${bundle.target}
+      description: "Energy portal (demo): half-hourly consumption from the Lakebase Data API. SYNTHETIC data."
+      source_code_path: ../app
+      config:
+        command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+        env:
+          - name: HH_PORTAL_DATA_API_URL
+            value: ${var.lakebase_data_api_url}
+          - name: HH_PORTAL_SCHEMA
+            value: portal_gold
+          - name: HH_PORTAL_ENVIRONMENT
+            value: ${bundle.target}
+          - name: HH_PORTAL_MAX_ROWS
+            value: ${var.max_rows}
+          # Architecture page links (identifiers only, never secrets). The workspace URL comes from
+          # DATABRICKS_HOST, which Databricks Apps set at runtime.
+          - name: HH_PORTAL_CATALOG
+            value: ${var.catalog}
+          - name: HH_PORTAL_DATA_SCHEMA
+            value: ${resources.schemas.data.name}
+          - name: HH_PORTAL_SYNCED_SCHEMA
+            value: portal
+          - name: HH_PORTAL_SYNC_PIPELINE_ID
+            value: ${var.sync_pipeline_id}
+          - name: HH_PORTAL_DAILY_JOB_ID
+            value: ${resources.jobs.hh_portal_daily.id}
+          - name: HH_PORTAL_SETUP_JOB_ID
+            value: ${resources.jobs.hh_portal_setup.id}
+          - name: HH_PORTAL_DAILY_SCHEDULE
+            value: "${var.daily_cron} (${var.daily_timezone})"
+          - name: HH_PORTAL_LAKEBASE_PROJECT
+            value: ${var.lakebase_project_id}
+          - name: HH_PORTAL_LAKEBASE_BRANCH
+            value: ${var.lakebase_branch_id}
+          - name: HH_PORTAL_LAKEBASE_PROJECT_UID
+            value: ${var.lakebase_project_uid}
+          - name: HH_PORTAL_LAKEBASE_BRANCH_UID
+            value: ${var.lakebase_branch_uid}
+          - name: HH_PORTAL_LAKEBASE_DATA_API_TAB
+            value: ${var.lakebase_data_api_tab_path}
+          - name: HH_PORTAL_REPO_URL
+            value: ${var.repo_url}

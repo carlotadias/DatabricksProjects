@@ -1,0 +1,47 @@
+# Daily refresh: append the next SYNTHETIC day -> incremental synced-table update -> gold MV refresh in Lakebase.
+# Runs as the deployer, who owns the gold materialized views (REFRESH needs the owner). PAUSED by default.
+resources:
+  jobs:
+    hh_portal_daily:
+      name: hh_portal_daily (${bundle.target})
+      description: "HH portal demo daily refresh: append the next SYNTHETIC day, sync silver to Lakebase, refresh gold."
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: ${var.daily_cron}
+        timezone_id: ${var.daily_timezone}
+        pause_status: ${var.daily_pause_status}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - databricks-sdk>=0.81
+              - psycopg[binary]>=3.2
+      tasks:
+        - task_key: append_day
+          environment_key: default
+          spark_python_task:
+            python_file: ../jobs/daily.py
+            parameters: ["--step", "append_day", "--catalog", "${var.catalog}",
+                         "--data-schema", "${resources.schemas.data.name}", "--months", "${var.history_months}",
+                         "--run-id", "{{job.run_id}}", "--bundle-root", "${workspace.file_path}"]
+        - task_key: sync_silver
+          depends_on:
+            - task_key: append_day
+          environment_key: default
+          spark_python_task:
+            python_file: ../jobs/daily.py
+            parameters: ["--step", "sync_silver", "--catalog", "${var.catalog}",
+                         "--data-schema", "${resources.schemas.data.name}",
+                         "--synced-table", "${var.catalog}.portal.silver_hh_readings",
+                         "--run-id", "{{job.run_id}}", "--bundle-root", "${workspace.file_path}"]
+        - task_key: refresh_gold
+          depends_on:
+            - task_key: sync_silver
+          environment_key: default
+          spark_python_task:
+            python_file: ../jobs/daily.py
+            parameters: ["--step", "refresh_gold", "--catalog", "${var.catalog}",
+                         "--data-schema", "${resources.schemas.data.name}",
+                         "--endpoint", "projects/${var.lakebase_project_id}/branches/${var.lakebase_branch_id}/endpoints/${var.lakebase_endpoint_id}",
+                         "--run-id", "{{job.run_id}}", "--bundle-root", "${workspace.file_path}"]

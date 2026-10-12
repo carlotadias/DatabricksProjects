@@ -1,0 +1,10 @@
+{
+  "catalog": "<CATALOG>",
+  "data_schema": "hh_portal_demo",
+  "app_name_prefix": "hh-portal",
+  "lakebase_project_id": "hh-portal-demo",
+  "lakebase_data_api_url": "<DATA_API_URL from scripts/provision.py outputs>",
+  "lakebase_project_uid": "",
+  "lakebase_branch_uid": "",
+  "sync_pipeline_id": ""
+}

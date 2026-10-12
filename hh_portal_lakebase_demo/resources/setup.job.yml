@@ -1,0 +1,24 @@
+# One-off: generate the SYNTHETIC data and build UC silver (13 months, Change Data Feed on). Runs as the deployer.
+resources:
+  jobs:
+    hh_portal_setup:
+      name: hh_portal_setup (${bundle.target})
+      description: "Generate SYNTHETIC organisations, accounts, sites, MPANs, tariffs and half-hourly readings into UC silver."
+      max_concurrent_runs: 1
+      parameters:
+        - name: rebuild
+          default: "false"
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - dbldatagen
+      tasks:
+        - task_key: generate
+          environment_key: default
+          spark_python_task:
+            python_file: ../jobs/setup.py
+            parameters: ["--catalog", "${var.catalog}", "--data-schema", "${resources.schemas.data.name}",
+                         "--mpan-target", "${var.mpan_target}", "--months", "${var.history_months}",
+                         "--rebuild", "{{job.parameters.rebuild}}", "--run-id", "{{job.run_id}}", "--bundle-root", "${workspace.file_path}"]

@@ -1,0 +1,7 @@
+.databricks/
+.venv/
+__pycache__/
+.pytest_cache/
+app/static/
+frontend/node_modules/
+frontend/dist/
